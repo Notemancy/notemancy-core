@@ -6,6 +6,8 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// src/config.rs
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GeneralConfig {
     pub indicator: Option<String>,
@@ -19,9 +21,28 @@ pub struct VaultProperties {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AIConfig {
+    pub model_name: Option<String>,
+    pub initial_capacity: Option<usize>,
+    #[serde(default = "default_ef_construction")]
+    pub ef_construction: usize,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+}
+
+fn default_ef_construction() -> usize {
+    800
+}
+
+fn default_max_connections() -> usize {
+    24
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub general: Option<GeneralConfig>,
     pub vaults: Option<HashMap<String, VaultProperties>>,
+    pub ai: Option<AIConfig>, // Added AI configuration
 }
 
 impl Default for Config {
@@ -39,6 +60,12 @@ impl Default for Config {
                 indicator: Some("notesy".into()),
             }),
             vaults: Some(vaults),
+            ai: Some(AIConfig {
+                model_name: Some("all-MiniLM-L12-v2".into()),
+                initial_capacity: Some(10000),
+                ef_construction: default_ef_construction(),
+                max_connections: default_max_connections(),
+            }),
         }
     }
 }
@@ -139,7 +166,6 @@ pub fn open_config_in_editor() -> Result<(), Box<dyn Error>> {
 pub fn setup_test_config(test_dir: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(test_dir)?;
     let config_file = test_dir.join("config.yaml");
-    // Note: no leading newline. Vaults is a mapping.
     let config_content = r#"general:
   indicator: "notesy"
 vaults:
@@ -150,6 +176,11 @@ vaults:
   work:
     paths:
       - "path/to/test_vault/work"
+ai:
+  model_path: "path/to/test/model"
+  initial_capacity: 1000
+  ef_construction: 800
+  max_connections: 24
 "#;
     fs::write(config_file, config_content)?;
     Ok(())
