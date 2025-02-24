@@ -1,10 +1,12 @@
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use serde_json;
 use serde_yaml;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Represents a file that was scanned from a vault.
 #[derive(Debug, Clone)]
@@ -68,43 +70,63 @@ impl Scanner {
     }
 
     pub fn scan_markdown_files(&self) -> Result<(Vec<ScannedFile>, String), Box<dyn Error>> {
-        let db = crate::db::Database::new()?;
-        let mut scanned_files = Vec::new();
-        let mut errors = Vec::<(PathBuf, String)>::new();
+        // Wrap the DB in an Arc<Mutex<>> if it's not thread-safe.
+        let db = Arc::new(Mutex::new(crate::db::Database::new()?));
 
-        for (vault, paths) in &self.vaults {
-            for vault_path in paths {
-                let files =
-                    list_files_with_extension(vault_path, &self.indicator, &["md", "markdown"]);
-                for file in files {
-                    match process_file(&file, &self.indicator, vault) {
-                        Ok(mut sf) => {
-                            sf.vault = vault.clone();
-                            let metadata_str = sf
-                                .metadata
-                                .as_ref()
-                                .map_or(String::new(), |m| m.to_string());
-                            if let Err(e) = db.add_page(
-                                vault,
-                                &sf.local_path.to_string_lossy(),
-                                &sf.virtual_path,
-                                &metadata_str,
-                                &sf.last_modified,
-                                &sf.created,
-                            ) {
-                                errors.push((file.clone(), format!("DB insert error: {}", e)));
-                            }
-                            scanned_files.push(sf);
-                        }
-                        Err(e) => {
-                            errors.push((file.clone(), format!("Processing error: {}", e)));
+        // Collect all file tasks from all vaults into a vector of (vault, file_path) pairs.
+        let tasks: Vec<(String, PathBuf)> = self
+            .vaults
+            .iter()
+            .flat_map(|(vault, paths)| {
+                paths.iter().flat_map(move |vault_path| {
+                    list_files_with_extension(vault_path, &self.indicator, &["md", "markdown"])
+                        .into_iter()
+                        .map(move |file| (vault.clone(), file))
+                })
+            })
+            .collect();
+
+        // Process files in parallel using Rayon.
+        let results: Vec<_> = tasks
+            .par_iter()
+            .map(|(vault, file)| {
+                match process_file(file, &self.indicator, vault) {
+                    Ok(mut sf) => {
+                        sf.vault = vault.clone();
+                        let metadata_str = sf
+                            .metadata
+                            .as_ref()
+                            .map_or(String::new(), |m| m.to_string());
+                        // Lock the DB for thread-safe access.
+                        let db_lock = db.lock().unwrap();
+                        match db_lock.add_page(
+                            vault,
+                            &sf.local_path.to_string_lossy(),
+                            &sf.virtual_path,
+                            &metadata_str,
+                            &sf.last_modified,
+                            &sf.created,
+                        ) {
+                            Ok(()) => Ok(sf),
+                            Err(e) => Err((file.clone(), format!("DB insert error: {}", e))),
                         }
                     }
+                    Err(e) => Err((file.clone(), format!("Processing error: {}", e))),
                 }
+            })
+            .collect();
+
+        // Separate successful scans and errors.
+        let mut scanned_files = Vec::new();
+        let mut errors = Vec::<(PathBuf, String)>::new();
+        for res in results {
+            match res {
+                Ok(sf) => scanned_files.push(sf),
+                Err(err) => errors.push(err),
             }
         }
 
-        // Build a summary string instead of printing directly.
+        // Build a summary string.
         let mut summary = String::new();
         if !errors.is_empty() {
             summary.push_str("The following errors occurred during markdown scanning:\n");

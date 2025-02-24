@@ -10,7 +10,7 @@ use std::error::Error;
 #[test]
 fn test_scanner_with_ready_test_env() -> Result<(), Box<dyn Error>> {
     // Setup the test environment.
-    setup_test_env(100)?;
+    setup_test_env(1000)?;
 
     // Load the configuration.
     let config = load_config()?;
@@ -24,7 +24,7 @@ fn test_scanner_with_ready_test_env() -> Result<(), Box<dyn Error>> {
     println!("Scan Summary:\n{}", summary);
     assert_eq!(
         md_files.len(),
-        101,
+        1001,
         "Expected 100 markdown files scanned from the default vault."
     );
 
@@ -36,7 +36,7 @@ fn test_scanner_with_ready_test_env() -> Result<(), Box<dyn Error>> {
     let pages = db.query_by_fields(&["path"])?;
     assert_eq!(
         pages.len(),
-        101,
+        1001,
         "Expected 101 pages (markdown files) in the pagetable."
     );
 

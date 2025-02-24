@@ -24,7 +24,7 @@ tempfile = "3.3"
 percent-encoding = "2.3.1"
 base64 = "*"
 mime_guess = "*"
-
+rayon = "1.10.0"
 
 
 [dev-dependencies]

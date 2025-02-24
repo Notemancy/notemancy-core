@@ -11,7 +11,7 @@ use tempfile::tempdir;
 #[test]
 fn integration_test_load_config_override() -> Result<(), Box<dyn Error>> {
     // reset_search()?;
-    setup_test_env(100)?;
+    setup_test_env(1000)?;
     let tmp_dir = tempdir()?;
     let config_dir = tmp_dir.path().join("gnosis");
     fs::create_dir_all(&config_dir)?;
