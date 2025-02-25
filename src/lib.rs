@@ -7,3 +7,4 @@ pub mod file_ops;
 pub mod scan;
 pub mod search;
 pub mod test_utils;
+pub mod vectordb;

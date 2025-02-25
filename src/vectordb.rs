@@ -1,10 +1,9 @@
 // src/vectordb.rs
 
-use qdrant_client::qdrant::point_id::PointIdOptions;
-use qdrant_client::qdrant::PointId;
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, Distance, GetCollectionInfoResponse, PointStruct, QueryPointsBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter,
+    GetCollectionInfoResponse, PointStruct, QueryPointsBuilder, UpsertPointsBuilder,
+    VectorParamsBuilder,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use serde_json::json;
@@ -35,18 +34,6 @@ pub struct SearchResult {
 }
 
 impl VectorDB {
-    fn point_id_to_u64(point_id: PointId) -> Result<u64, QdrantError> {
-        match point_id.point_id_options {
-            Some(PointIdOptions::Num(n)) => Ok(n),
-            Some(PointIdOptions::Uuid(_)) => Err(QdrantError::ConversionError(
-                "Expected numeric id but got UUID".to_string(),
-            )),
-            None => Err(QdrantError::ConversionError(
-                "Missing point id options".to_string(),
-            )),
-        }
-    }
-
     /// Connect to a Qdrant instance and return a new `VectorDB`.
     ///
     /// # Arguments
@@ -212,12 +199,12 @@ impl VectorDB {
             )
             .await?;
 
-        // query_response.result is already a Vec<ScoredPoint>
+        // query_response.result is a Vec<ScoredPoint>
         let points = query_response.result;
 
         let mut results = Vec::with_capacity(points.len());
         for point in points {
-            // Extract payload fields using try_get.
+            // Use try_get to retrieve the payload fields.
             let local_path = point
                 .try_get("local_path")
                 .and_then(|v| v.as_str())
@@ -243,5 +230,47 @@ impl VectorDB {
             });
         }
         Ok(results)
+    }
+
+    /// Helper function to convert a PointId to a u64.
+    fn point_id_to_u64(point_id: qdrant_client::qdrant::PointId) -> Result<u64, QdrantError> {
+        use qdrant_client::qdrant::point_id::PointIdOptions;
+        match point_id.point_id_options {
+            Some(PointIdOptions::Num(n)) => Ok(n),
+            Some(PointIdOptions::Uuid(_)) => Err(QdrantError::ConversionError(
+                "Expected numeric id but got UUID".to_string(),
+            )),
+            None => Err(QdrantError::ConversionError(
+                "Missing point id options".to_string(),
+            )),
+        }
+    }
+
+    /// Deletes points from a collection by matching a field (e.g., "local_path" or "virtual_path")
+    /// with a provided value.
+    ///
+    /// # Arguments
+    ///
+    /// * `collection_name` - The target collection name.
+    /// * `field` - The field to match (e.g., "local_path" or "virtual_path").
+    /// * `value` - The value to match for deletion.
+    ///
+    /// # Returns
+    ///
+    /// A Result with unit type on success or a `QdrantError` on failure.
+    pub async fn delete_points_by_field(
+        &self,
+        collection_name: &str,
+        field: &str,
+        value: String,
+    ) -> Result<(), QdrantError> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(collection_name)
+                    .points(Filter::must([Condition::matches(field, value)]))
+                    .wait(true),
+            )
+            .await?;
+        Ok(())
     }
 }
