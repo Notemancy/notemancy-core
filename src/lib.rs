@@ -9,3 +9,4 @@ pub mod model_setup;
 pub mod scan;
 pub mod search;
 pub mod test_utils;
+pub mod vec_indexer;
