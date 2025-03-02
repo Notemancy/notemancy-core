@@ -1,297 +1,194 @@
-use crate::config;
-use anyhow::Result;
+// src/ai.rs
+use crate::config::{self, Config};
+use crate::embedding_config::EmbeddingManager;
+use anyhow::{anyhow, Result};
 use rust_bert::pipelines::sentence_embeddings::{
     SentenceEmbeddingsBuilder, SentenceEmbeddingsModel,
 };
 use std::collections::HashMap;
-use std::error::Error;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::path::PathBuf;
 use tch::Device;
 
-use anndists::dist::DistDot;
-use hnsw_rs::{api::AnnT, hnsw::Neighbour, prelude::*};
-
-/// A struct that encapsulates the Sentence Embeddings model.
-pub struct AIModel {
+/// AI module for generating and managing document embeddings
+pub struct AI {
+    /// The sentence embeddings model
     model: SentenceEmbeddingsModel,
+    /// The embedding manager for storage
+    embedding_manager: EmbeddingManager,
 }
 
-impl AIModel {
-    /// Creates a new instance of AIModel from a local model path.
-    pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
-        let model_path_str = model_path
-            .as_ref()
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid model path"))?;
-        let model = SentenceEmbeddingsBuilder::local(model_path_str)
-            .with_device(Device::cuda_if_available())
-            .create_model()?;
-        Ok(Self { model })
-    }
+impl AI {
+    /// Create a new AI instance with the given configuration
+    pub async fn new(config: &Config) -> Result<Self> {
+        // Initialize the embedding manager
+        let embedding_manager = EmbeddingManager::new(config)
+            .await
+            .map_err(|e| anyhow!("Failed to initialize embedding manager: {}", e))?;
 
-    /// Generates an embedding for the provided document.
-    pub fn embed_document(&self, document: &str) -> Result<Vec<f32>> {
-        let mut embedding = self.model.encode(&[document])?;
-        let vec = embedding
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("No embedding produced"))?;
-
-        // Normalize the vector to unit length for better HNSW performance
-        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let normalized = vec.iter().map(|x| x / norm).collect();
-        Ok(normalized)
-    }
-}
-
-pub struct AIStore {
-    pub ai_model: AIModel,
-    pub hnsw: Hnsw<'static, f32, DistDot>,
-    pub mapping: HashMap<String, Vec<f32>>,
-}
-
-impl AIStore {
-    pub fn new_with_params<P: AsRef<Path>>(
-        model_path: P,
-        initial_capacity: usize,
-        max_connections: usize,
-        ef_construction: usize,
-    ) -> Result<Self, Box<dyn Error>> {
-        let ai_model = AIModel::new(model_path)?;
-        let config_dir = config::get_config_dir()?;
-        let mapping_path = config_dir.join("hnsw_mapping.json");
-
-        // Initialize HNSW
-        let mut hnsw = Hnsw::<f32, DistDot>::new(
-            max_connections,
-            initial_capacity,
-            16,
-            ef_construction,
-            DistDot {},
-        );
-        hnsw.set_extend_candidates(true);
-
-        // Load mapping if exists
-        let mapping = if mapping_path.exists() {
-            let file = File::open(&mapping_path)?;
-            let reader = BufReader::new(file);
-            serde_json::from_reader(reader)?
-        } else {
-            HashMap::new()
-        };
-
-        // Load HNSW index if exists
-        if mapping_path.exists() {
-            let basename = "hnsw_index";
-            // The file_dump creates both .hnsw.graph and .hnsw.data files
-            if config_dir.join(format!("{}.hnsw.graph", basename)).exists() {
-                // Create the reloader and leak it so its lifetime becomes 'static.
-                let reloader = Box::new(HnswIo::new(&config_dir, basename));
-                let reloader_static: &'static mut HnswIo = Box::leak(reloader);
-                hnsw = reloader_static.load_hnsw::<f32, DistDot>()?;
-            }
-        }
+        // Initialize the model
+        let model = Self::init_model()
+            .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
 
         Ok(Self {
-            ai_model,
-            hnsw,
-            mapping,
+            model,
+            embedding_manager,
         })
     }
 
-    pub fn from_config() -> Result<Self, Box<dyn Error>> {
-        let config = crate::config::load_config()?;
-        let ai_config = config.ai.ok_or("No AI configuration found")?;
-        let model_name = ai_config.model_name.ok_or("No AI model name configured")?;
+    /// Initialize the sentence embeddings model from the config directory
+    fn init_model() -> Result<SentenceEmbeddingsModel> {
+        // Model name - hardcoded since we only support one model
+        let model_name = "all-MiniLM-L12-v2";
 
-        // Construct full model path from manifest directory
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let model_path = format!("{}/resources/{}", manifest_dir, model_name);
+        // Get the config directory
+        let config_dir = config::get_config_dir()
+            .map_err(|e| anyhow!("Failed to get config directory: {}", e))?;
 
-        // Fixed parameters that work with HNSW-rs
-        let initial_capacity = 100;
-        let max_connections = 16;
-        let ef_construction = 100;
+        // Path to the model in the config directory
+        let model_path = config_dir.join(model_name);
 
-        Self::new_with_params(
-            model_path,
-            initial_capacity,
-            max_connections,
-            ef_construction,
-        )
-    }
-
-    pub fn add_document(
-        &mut self,
-        document: &str,
-        virtual_path: &str,
-    ) -> Result<(), Box<dyn Error>> {
-        // Compute the embedding
-        let embedding = self.ai_model.embed_document(document)?;
-        let new_id = self.hnsw.get_nb_point();
-
-        // Insert into HNSW index
-        self.hnsw.insert_data(&embedding, new_id);
-
-        // Update the mapping
-        self.mapping.insert(virtual_path.to_string(), embedding);
-
-        // Save both index and mapping
-        self.save()?;
-        Ok(())
-    }
-
-    /// Add multiple documents in parallel
-    pub fn add_documents(&mut self, documents: &[(&str, &str)]) -> Result<(), Box<dyn Error>> {
-        for (content, path) in documents {
-            self.add_document(content, path)?;
+        // Check if the model exists in the config directory
+        if !model_path.exists() {
+            return Err(anyhow!(
+                "Model '{}' not found in config directory: {:?}. \
+                Please download the model and place it in this directory.",
+                model_name,
+                model_path
+            ));
         }
+
+        // Load the model from the config directory
+        let model = SentenceEmbeddingsBuilder::local(model_path.to_str().unwrap())
+            .with_device(Device::cuda_if_available())
+            .create_model()
+            .map_err(|e| anyhow!("Failed to load model from config directory: {}", e))?;
+
+        Ok(model)
+    }
+
+    /// Generate embeddings for a document
+    pub fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        // Encode the text to get embeddings
+        let embeddings = self
+            .model
+            .encode(&[text])
+            .map_err(|e| anyhow!("Failed to generate embeddings: {}", e))?;
+
+        // Get the first embedding (for the single document)
+        let embedding = embeddings[0].clone();
+
+        Ok(embedding)
+    }
+
+    /// Store a document embedding in the database
+    pub async fn store_document_embedding(
+        &self,
+        id: &str,
+        text: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        // Generate the embedding
+        let embedding = self.generate_embedding(text)?;
+
+        // Create the document embedding
+        let doc_embedding = crate::embeddings::DocumentEmbedding {
+            id: id.to_string(),
+            embedding,
+            metadata,
+        };
+
+        // Store the embedding in the database
+        let table_name = self.embedding_manager.get_table_name("documents");
+        self.embedding_manager
+            .store()
+            .add_embeddings(&table_name, vec![doc_embedding])
+            .await
+            .map_err(|e| anyhow!("Failed to store document embedding: {}", e))?;
+
         Ok(())
     }
 
-    /// Searches for similar documents with optimized parameters
-    pub fn search(&self, query: &str, k: usize) -> Result<Vec<Neighbour>, Box<dyn Error>> {
-        let embedding = self.ai_model.embed_document(query)?;
+    /// Find similar documents by text
+    pub async fn find_similar_documents(
+        &self,
+        text: &str,
+        limit: usize,
+        metadata_filter: Option<&str>,
+    ) -> Result<Vec<(crate::embeddings::DocumentEmbedding, f32)>> {
+        // Generate embedding for the query text
+        let query_embedding = self.generate_embedding(text)?;
 
-        // Optimized ef_search based on k
-        let ef_search = if k <= 10 { 48 } else { 128 };
+        // Find similar documents
+        let table_name = self.embedding_manager.get_table_name("documents");
+        let results = self
+            .embedding_manager
+            .store()
+            .similarity_search(&table_name, query_embedding, limit, metadata_filter)
+            .await
+            .map_err(|e| anyhow!("Failed to find similar documents: {}", e))?;
 
-        // Search with optimized parameters
-        Ok(self.hnsw.search_neighbours(&embedding, k, ef_search))
+        Ok(results)
     }
 
-    /// Parallel search for multiple queries
-    pub fn parallel_search(&self, queries: &[&str], k: usize) -> Result<Vec<Vec<Neighbour>>> {
-        let embeddings: Result<Vec<Vec<f32>>> = queries
-            .iter()
-            .map(|q| self.ai_model.embed_document(q))
-            .collect();
-        let embeddings = embeddings?;
-
-        let ef_search = if k <= 10 { 48 } else { 128 };
-
-        Ok(self
-            .hnsw
-            .parallel_search_neighbours(&embeddings, k, ef_search))
-    }
-
-    pub fn save(&self) -> Result<(), Box<dyn Error>> {
-        let config_dir = config::get_config_dir()?;
-        let mapping_path = config_dir.join("hnsw_mapping.json");
-
-        // Save the HNSW index using AnnT trait
-        let basename = "hnsw_index";
-        self.hnsw.file_dump(&config_dir, basename)?;
-
-        // Save the mapping
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(mapping_path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &self.mapping)?;
+    /// Delete a document embedding by ID
+    pub async fn delete_document_embedding(&self, id: &str) -> Result<()> {
+        let table_name = self.embedding_manager.get_table_name("documents");
+        self.embedding_manager
+            .store()
+            .delete_embeddings(&table_name, vec![id.to_string()])
+            .await
+            .map_err(|e| anyhow!("Failed to delete document embedding: {}", e))?;
 
         Ok(())
-    }
-
-    /// Get the number of documents in the store
-    pub fn len(&self) -> usize {
-        self.mapping.len()
-    }
-
-    /// Check if the store is empty
-    pub fn is_empty(&self) -> bool {
-        self.mapping.is_empty()
-    }
-
-    /// Returns a reference to the mapping.
-    pub fn get_mapping(&self) -> &HashMap<String, Vec<f32>> {
-        &self.mapping
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// Helper function to convert a document into a metadata map
+pub fn document_to_metadata(
+    title: Option<&str>,
+    author: Option<&str>,
+    date: Option<&str>,
+    tags: Option<Vec<&str>>,
+    additional_fields: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
 
-    fn setup_test_env() -> Result<(), Box<dyn Error>> {
-        let config_dir = config::get_config_dir()?;
-        std::fs::create_dir_all(&config_dir)?;
-
-        // Clean up any existing files from previous runs
-        let mapping_file = config_dir.join("hnsw_mapping.json");
-        if mapping_file.exists() {
-            std::fs::remove_file(&mapping_file)?;
-        }
-        let index_graph = config_dir.join("hnsw_index.hnsw.graph");
-        if index_graph.exists() {
-            std::fs::remove_file(&index_graph)?;
-        }
-        let index_data = config_dir.join("hnsw_index.hnsw.data");
-        if index_data.exists() {
-            std::fs::remove_file(&index_data)?;
-        }
-
-        let config_content = r#"
-general:
-  indicator: "notesy"
-vaults:
-  main:
-    default: true
-    paths:
-      - "path/to/test_vault/main"
-ai:
-  model_name: "all-MiniLM-L12-v2"
-  initial_capacity: 100
-  ef_construction: 100
-  max_connections: 16
-"#;
-        let config_file = config_dir.join("config.yaml");
-        std::fs::write(&config_file, config_content)?;
-        Ok(())
+    // Add basic metadata fields if provided
+    if let Some(title) = title {
+        metadata.insert("title".to_string(), title.to_string());
+    }
+    if let Some(author) = author {
+        metadata.insert("author".to_string(), author.to_string());
+    }
+    if let Some(date) = date {
+        metadata.insert("date".to_string(), date.to_string());
+    }
+    if let Some(tags) = tags {
+        let tags_str = tags.join(",");
+        metadata.insert("tags".to_string(), tags_str);
     }
 
-    #[test]
-    fn test_ai_store_with_test_env() -> Result<(), Box<dyn Error>> {
-        setup_test_env()?;
-
-        // First instance: add documents
-        {
-            let mut ai_store = AIStore::from_config()?;
-            assert_eq!(ai_store.len(), 0, "Should start empty");
-
-            let test_docs = vec![
-                ("This is a test document about programming", "doc1.md"),
-                ("Another document about testing software", "doc2.md"),
-                ("A third document about rust programming", "doc3.md"),
-            ];
-
-            ai_store.add_documents(&test_docs)?;
-            assert_eq!(ai_store.len(), 3, "Should have 3 documents after adding");
-            ai_store.save()?;
-        }
-
-        // Second instance: verify loading
-        {
-            let loaded_store = AIStore::from_config()?;
-            assert_eq!(
-                loaded_store.len(),
-                3,
-                "Should have 3 documents after loading"
-            );
-            assert_eq!(
-                loaded_store.hnsw.get_nb_point(),
-                3,
-                "HNSW should have 3 points"
-            );
-
-            // Test search functionality
-            let results = loaded_store.search("programming in rust", 2)?;
-            assert_eq!(results.len(), 2, "Should find 2 nearest neighbors");
-        }
-
-        Ok(())
+    // Add any additional fields
+    if let Some(additional) = additional_fields {
+        metadata.extend(additional);
     }
+
+    metadata
+}
+
+/// Helper function to check if the embedding model is available in the config directory
+pub fn is_model_available() -> bool {
+    if let Ok(config_dir) = config::get_config_dir() {
+        let model_path = config_dir.join("all-MiniLM-L12-v2");
+        model_path.exists()
+    } else {
+        false
+    }
+}
+
+/// Helper function to get the path where the model should be installed
+pub fn get_model_path() -> Result<PathBuf> {
+    let config_dir =
+        config::get_config_dir().map_err(|e| anyhow!("Failed to get config directory: {}", e))?;
+    Ok(config_dir.join("all-MiniLM-L12-v2"))
 }

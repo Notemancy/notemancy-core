@@ -232,15 +232,24 @@ impl EmbeddingStore for LanceDBStore {
             .await
             .context("Failed to add embeddings to table")?;
 
-        // If table was just created, create a vector index now that we have data
+        // If this is the first time adding data, create a vector index
         if !table_existed {
-            // Create a vector index on the embedding column
-            // We can safely create an index now because we've just added data
-            table
+            // Sleep for a very short time to ensure data is committed
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Try to create the vector index
+            match table
                 .create_index(&["embedding"], lancedb::index::Index::Auto)
                 .execute()
                 .await
-                .context("Failed to create vector index")?;
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    // Just log the error but don't fail the operation
+                    // This is because the data is already stored successfully
+                    eprintln!("Warning: Failed to create vector index: {}. Data is stored but search performance may be affected.", e);
+                }
+            }
         }
 
         Ok(())
