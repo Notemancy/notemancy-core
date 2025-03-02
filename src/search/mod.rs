@@ -1,14 +1,12 @@
 use crate::config::get_config_dir;
 use crate::db::Database;
-use std::collections::HashMap;
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 
 pub mod advanced;
 
@@ -299,7 +297,7 @@ impl SearchEngine {
 
     /// Optimize the index for faster searching
     pub fn optimize(&self) -> Result<(), Box<dyn Error>> {
-        let mut writer = self.get_writer()?;
+        let writer = self.get_writer()?;
         // In tantivy 0.22.0, merge() returns a Future and requires segment IDs
         // For a simple optimization, we'll use the simpler API:
         writer.wait_merging_threads()?;

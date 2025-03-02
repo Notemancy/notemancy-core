@@ -1,10 +1,6 @@
 use super::SearchEngine;
 use std::error::Error;
 use std::fs;
-use tantivy::directory::MmapDirectory;
-use tantivy::merge_policy::LogMergePolicy;
-use tantivy::schema::IndexRecordOption;
-use tantivy::tokenizer::{Language, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer};
 
 /// Advanced snippet extraction that tries to find the most relevant
 /// part of the document containing search terms
@@ -106,6 +102,7 @@ pub fn extract_relevant_snippet(
 
 /// Enhanced search engine with more advanced configurations
 pub fn configure_enhanced_search(engine: &mut SearchEngine) -> Result<(), Box<dyn Error>> {
+    let _ = engine;
     // This function would modify the search engine's index writer to use
     // more advanced configurations. This is a placeholder for such functionality.
 
