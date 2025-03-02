@@ -27,7 +27,7 @@ pub async fn index_markdown_files(ai: &AI) -> Result<()> {
     // Process each file record.
     for record in file_records {
         if record.path.ends_with(".md") || record.path.ends_with(".markdown") {
-            println!("Processing file: {}", record.path);
+            // println!("Processing file: {}", record.path);
 
             // Read the file content in a blocking thread.
             // Clone the path for later use in the error message.
