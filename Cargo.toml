@@ -10,7 +10,6 @@ serde_json = "1.0"
 dirs = "4"
 rusqlite = "0.33"
 ignore = "0.4"
-meilisearch-sdk = "0.27"
 color-eyre = "0.6"
 tokio = { version = "1.0", features = ["full" ] }
 portpicker = "*"
@@ -24,8 +23,6 @@ percent-encoding = "2.3.1"
 base64 = "*"
 mime_guess = "*"
 rayon = "1.10.0"
-hnsw_rs = { git = "https://github.com/jean-pierreBoth/hnswlib-rs.git", branch = "master" }
-anndists = { version = "0.1.2" }
 qdrant-client = "1.7.0"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
