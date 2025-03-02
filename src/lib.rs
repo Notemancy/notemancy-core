@@ -1,9 +1,9 @@
 pub mod config;
 pub mod db;
+pub mod embedding_config;
 pub mod embeddings;
 pub mod fetch;
 pub mod file_ops;
 pub mod scan;
 pub mod search;
 pub mod test_utils;
-pub mod vectordb;
