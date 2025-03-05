@@ -23,10 +23,6 @@ pub struct FileRecord {
 }
 
 impl Database {
-    /// Creates a new `Database` instance.
-    ///
-    /// This function ensures that the database directory exists (creating it if needed)
-    /// and sets the path to the SQLite database file.
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let config_dir = get_config_dir()?;
         let db_dir = config_dir.join("db");
@@ -35,7 +31,29 @@ impl Database {
             println!("Created database directory: {:?}", db_dir);
         }
         let db_path = db_dir.join("database.sqlite");
-        Ok(Database { db_path })
+
+        // Create the Database instance
+        let db = Database { db_path };
+
+        // Check if the database file exists and has tables
+        let should_initialize = if !db.db_path.exists() {
+            true // New database needs initialization
+        } else {
+            // Check if tables exist
+            let conn = db.connect()?;
+            let mut stmt = conn.prepare(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('pagetable', 'attachments')"
+        )?;
+            let count: i64 = stmt.query_row([], |row| row.get(0))?;
+            count < 2 // If we don't have both tables, we need to initialize
+        };
+
+        // Run migrations if needed
+        if should_initialize {
+            db.setup()?;
+        }
+
+        Ok(db)
     }
 
     /// Opens a new connection to the database.
@@ -212,6 +230,6 @@ impl Database {
 /// This creates the necessary directory and database file, then runs migrations.
 pub fn setup_database() -> Result<(), Box<dyn Error>> {
     let db = Database::new()?;
-    db.setup()?;
+    // db.setup()?;
     Ok(())
 }

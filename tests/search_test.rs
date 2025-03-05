@@ -3,7 +3,7 @@ use common::setup_test_env;
 use notemancy_core::config::load_config;
 use notemancy_core::db::Database;
 use notemancy_core::scan::Scanner;
-use notemancy_core::search::{init_search_engine, SearchEngine};
+use notemancy_core::search::init_search_engine;
 use std::error::Error;
 use std::path::PathBuf;
 

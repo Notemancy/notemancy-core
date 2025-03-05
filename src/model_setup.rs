@@ -13,7 +13,7 @@ pub async fn ensure_model_available() -> Result<()> {
         config::get_config_dir().map_err(|e| anyhow!("Failed to get config directory: {}", e))?;
 
     // Model name - hardcoded since we only support one model
-    let model_name = "all-MiniLM-L12-v2";
+    let model_name = "all-MiniLM-L6-v2";
     let model_path = config_dir.join(model_name);
 
     // If the model directory doesn't exist, create it and download the model
@@ -36,25 +36,24 @@ pub async fn ensure_model_available() -> Result<()> {
     Ok(())
 }
 
-/// Downloads the all-MiniLM-L12-v2 model to the specified path
+/// Downloads the all-MiniLM-L6-v2 model to the specified path
 fn download_model(model_path: &Path) -> Result<()> {
     // This is a bit of a hack - we're using rust-bert's remote model functionality
     // to get the model, then we'll just keep it in our target location
 
     // Download the model - this will cache it in the rust-bert default location
     // Here we use the correct enum value instead of a string
-    let _temp_model =
-        SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
-            .create_model()
-            .map_err(|e| anyhow!("Failed to download model: {}", e))?;
+    let _temp_model = SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL6V2)
+        .create_model()
+        .map_err(|e| anyhow!("Failed to download model: {}", e))?;
 
     // Now find where rust-bert cached it - we know it's in the default cache location
 
     // On Unix-like systems (Linux, macOS):
-    // $HOME/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L12-v2
+    // $HOME/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2
 
     // On Windows:
-    // C:\Users\username\AppData\Local\huggingface\hub\models--sentence-transformers--all-MiniLM-L12-v2
+    // C:\Users\username\AppData\Local\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2
 
     let cache_dir = if cfg!(windows) {
         let local_app_data = std::env::var("LOCALAPPDATA")
@@ -70,7 +69,7 @@ fn download_model(model_path: &Path) -> Result<()> {
     };
 
     let model_cache_path = cache_dir
-        .join("models--sentence-transformers--all-MiniLM-L12-v2")
+        .join("models--sentence-transformers--all-MiniLM-L6-v2")
         .join("snapshots");
 
     // Find the snapshot directory (should have a hash as its name)
@@ -129,18 +128,16 @@ fn download_model(model_path: &Path) -> Result<()> {
 /// A more manual approach to download the model
 /// This can be used if the automatic download doesn't work
 pub fn print_manual_download_instructions() {
-    println!("To manually download the all-MiniLM-L12-v2 model:");
-    println!("1. Go to https://huggingface.co/sentence-transformers/all-MiniLM-L12-v2/tree/main");
+    println!("To manually download the all-MiniLM-L6-v2 model:");
+    println!("1. Go to https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/tree/main");
     println!("2. Download all files from the repository");
 
     if let Ok(model_path) = config::get_config_dir() {
-        let model_dir = model_path.join("all-MiniLM-L12-v2");
+        let model_dir = model_path.join("all-MiniLM-L6-v2");
         println!("3. Create the directory: {:?}", model_dir);
         println!("4. Place all downloaded files in this directory");
     } else {
-        println!(
-            "3. Place all files in the 'all-MiniLM-L12-v2' directory in your config directory"
-        );
+        println!("3. Place all files in the 'all-MiniLM-L6-v2' directory in your config directory");
     }
 
     println!("5. Restart the application");

@@ -11,16 +11,16 @@ async fn test_basic_embedding_flow() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if the model exists in the config directory
     let config_dir = notemancy_core::config::get_config_dir()?;
-    let model_dir = config_dir.join("all-MiniLM-L12-v2");
+    let model_dir = config_dir.join("all-MiniLM-L6-v2");
 
     if !model_exists(&model_dir) {
         println!("=================================================================");
         println!("Model not found at: {:?}", model_dir);
         println!(
-            "Please ensure you have the all-MiniLM-L12-v2 model files in your config directory."
+            "Please ensure you have the all-MiniLM-L6-v2 model files in your config directory."
         );
         println!(
-            "For macOS, this should be at: ~/Library/Application Support/gnosis/all-MiniLM-L12-v2"
+            "For macOS, this should be at: ~/Library/Application Support/gnosis/all-MiniLM-L6-v2"
         );
         println!("=================================================================");
         return Ok(());
@@ -40,7 +40,7 @@ async fn test_basic_embedding_flow() -> Result<(), Box<dyn std::error::Error>> {
     let test_text = "This is a test document about artificial intelligence.";
     let embedding = ai.generate_embedding(test_text)?;
 
-    // Verify embedding dimension (all-MiniLM-L12-v2 produces 384-dimensional vectors)
+    // Verify embedding dimension (all-MiniLM-L6-v2 produces 384-dimensional vectors)
     assert_eq!(embedding.len(), 384);
     println!(
         "Successfully generated embedding with dimension: {}",

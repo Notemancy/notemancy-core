@@ -38,7 +38,7 @@ impl AI {
     /// Initialize the sentence embeddings model from the config directory
     fn init_model() -> Result<SentenceEmbeddingsModel> {
         // Model name - hardcoded since we only support one model
-        let model_name = "all-MiniLM-L12-v2";
+        let model_name = "all-MiniLM-L6-v2";
 
         // Get the config directory
         let config_dir = config::get_config_dir()
@@ -179,7 +179,7 @@ pub fn document_to_metadata(
 /// Helper function to check if the embedding model is available in the config directory
 pub fn is_model_available() -> bool {
     if let Ok(config_dir) = config::get_config_dir() {
-        let model_path = config_dir.join("all-MiniLM-L12-v2");
+        let model_path = config_dir.join("all-MiniLM-L6-v2");
         model_path.exists()
     } else {
         false
@@ -190,5 +190,5 @@ pub fn is_model_available() -> bool {
 pub fn get_model_path() -> Result<PathBuf> {
     let config_dir =
         config::get_config_dir().map_err(|e| anyhow!("Failed to get config directory: {}", e))?;
-    Ok(config_dir.join("all-MiniLM-L12-v2"))
+    Ok(config_dir.join("all-MiniLM-L6-v2"))
 }

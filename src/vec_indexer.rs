@@ -8,16 +8,9 @@ use std::fs;
 use std::path::Path;
 use tokio::task;
 
-const SIMILARITY_THRESHOLD: f32 = 0.7; // Similarity threshold (adjust as needed)
+const SIMILARITY_THRESHOLD: f32 = 0.1; // Similarity threshold (adjust as needed)
 const MAX_RESULTS: usize = 20;
 
-/// Index markdown files in the workspace by generating embeddings and storing them in the database.
-///
-/// This function does the following:
-/// 1. Wraps blocking database calls in a spawn_blocking closure.
-/// 2. Filters the records to include only files with a ".md" or ".markdown" extension.
-/// 3. Reads the file contents (also in a blocking closure) and builds a metadata map.
-/// 4. Uses the AI instance to generate and store the embedding.
 pub async fn index_markdown_files(ai: &AI) -> Result<()> {
     // Wrap blocking DB operations using spawn_blocking
     let file_records = task::spawn_blocking(|| {
@@ -28,13 +21,18 @@ pub async fn index_markdown_files(ai: &AI) -> Result<()> {
     .await
     .map_err(|e| anyhow!("Task join error: {}", e))??;
 
-    // Process each file record.
+    // Track which physical paths we've indexed in this run to prevent duplicates
+    let mut indexed_paths = std::collections::HashSet::new();
+
+    // Process each file record
     for record in file_records {
         if record.path.ends_with(".md") || record.path.ends_with(".markdown") {
-            // println!("Processing file: {}", record.path);
+            // Skip if we've already indexed this physical path in this run
+            if !indexed_paths.insert(record.path.clone()) {
+                continue;
+            }
 
-            // Read the file content in a blocking thread.
-            // Clone the path for later use in the error message.
+            // Read the file content in a blocking thread
             let path = record.path.clone();
             let path_for_error = path.clone();
             let content = task::spawn_blocking(move || fs::read_to_string(&path))
@@ -42,17 +40,21 @@ pub async fn index_markdown_files(ai: &AI) -> Result<()> {
                 .map_err(|e| anyhow!("Task join error: {}", e))?
                 .map_err(|e| anyhow!("Failed to read file {}: {}", path_for_error, e))?;
 
-            // Build a metadata map using available record data.
+            // Build a metadata map using available record data
             let mut metadata = HashMap::new();
             metadata.insert("physical_path".to_string(), record.path.clone());
             metadata.insert("virtual_path".to_string(), record.virtual_path.clone());
             metadata.insert("record_metadata".to_string(), record.metadata.clone());
 
-            // Use the virtual path as the unique identifier.
-            let id = record.virtual_path.as_str();
+            // Use a more unique ID format that includes both virtual path and physical path
+            // This helps ensure we don't get ID collisions while maintaining uniqueness for physical paths
+            let id = format!("{}|{}", record.virtual_path, record.path);
 
-            // Generate and store the embedding.
-            ai.store_document_embedding(id, &content, metadata).await?;
+            // Try to delete any existing embedding with this ID first (ignore errors if not found)
+            let _ = ai.delete_document_embedding(&id).await;
+
+            // Generate and store the embedding
+            ai.store_document_embedding(&id, &content, metadata).await?;
         }
     }
     Ok(())

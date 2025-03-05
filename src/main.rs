@@ -5,7 +5,7 @@ use tch::Device;
 fn main() -> Result<()> {
     // Using an absolute path from the Cargo manifest directory:
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = format!("{}/resources/all-MiniLM-L12-v2", manifest_dir);
+    let model_path = format!("{}/resources/all-MiniLM-L6-v2", manifest_dir);
     println!("{:?}", model_path);
 
     // Create the model using the local resource folder

@@ -61,7 +61,7 @@ impl Default for Config {
             }),
             vaults: Some(vaults),
             ai: Some(AIConfig {
-                model_name: Some("all-MiniLM-L12-v2".into()),
+                model_name: Some("all-MiniLM-L6-v2".into()),
                 initial_capacity: Some(10000),
                 ef_construction: default_ef_construction(),
                 max_connections: default_max_connections(),
