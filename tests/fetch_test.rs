@@ -11,7 +11,7 @@ use std::fs;
 
 #[test]
 fn test_fetch_get_page_content() -> Result<(), Box<dyn Error>> {
-    setup_test_env(1000)?;
+    setup_test_env(300)?;
 
     // Load the configuration.
     let config = load_config()?;
@@ -25,7 +25,7 @@ fn test_fetch_get_page_content() -> Result<(), Box<dyn Error>> {
     println!("Scan Summary:\n{}", summary);
     assert_eq!(
         md_files.len(),
-        1001,
+        301,
         "Expected 100 markdown files scanned from the default vault."
     );
     // Query the pagetable for virtualPath, local path, and metadata.

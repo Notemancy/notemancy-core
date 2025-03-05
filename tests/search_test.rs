@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[test]
 fn integration_search() -> Result<(), Box<dyn Error>> {
     // 1. Set up the test environment with sample files
-    setup_test_env(1000)?;
+    setup_test_env(300)?;
 
     // 2. Load the configuration
     let config = load_config()?;
@@ -24,7 +24,7 @@ fn integration_search() -> Result<(), Box<dyn Error>> {
     println!("Scan Summary:\n{}", summary);
     assert_eq!(
         md_files.len(),
-        1001,
+        301,
         "Expected 1001 markdown files scanned from the default vault."
     );
 

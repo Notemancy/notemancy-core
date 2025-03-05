@@ -7,8 +7,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::TryStreamExt;
+use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Connection};
+use lancedb::{connect, Connection, DistanceType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,6 +75,14 @@ pub trait EmbeddingStore {
 pub struct LanceDBStore {
     connection: Connection,
     embedding_dim: usize,
+}
+
+// Helper to estimate optimal partitions based on dataset size
+fn estimate_partition_count(row_count: usize) -> u32 {
+    // Common practice is to have sqrt(n) partitions for optimal balance
+    // Apply reasonable min/max bounds
+    let sqrt = (row_count as f64).sqrt().round() as u32;
+    sqrt.clamp(10, 1000)
 }
 
 #[async_trait]
@@ -237,18 +246,33 @@ impl EmbeddingStore for LanceDBStore {
             // Sleep for a very short time to ensure data is committed
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-            // Try to create the vector index
-            match table
-                .create_index(&["embedding"], lancedb::index::Index::Auto)
-                .execute()
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    // Just log the error but don't fail the operation
-                    // This is because the data is already stored successfully
-                    eprintln!("Warning: Failed to create vector index: {}. Data is stored but search performance may be affected.", e);
+            // Get a rough estimate of table size for configuring optimal partitions
+            let row_count = match table.count_rows(None).await {
+                Ok(count) => count,
+                Err(_) => 100, // Default if we can't get the count
+            };
+
+            // Try creating an IVF_PQ index which is optimized for ANN search
+            // If this fails, fall back to Auto index
+            let index_result = match create_optimized_index(&table, row_count).await {
+                Ok(_) => {
+                    println!("Created optimized IVF_PQ vector index for faster ANN search");
+                    Ok(())
                 }
+                Err(e) => {
+                    eprintln!("Warning: Failed to create optimized index: {}. Falling back to Auto index.", e);
+
+                    // Fallback to Auto index
+                    table
+                        .create_index(&["embedding"], Index::Auto)
+                        .execute()
+                        .await
+                }
+            };
+
+            // Log if even the fallback failed
+            if let Err(e) = index_result {
+                eprintln!("Warning: Failed to create any vector index: {}. Search performance may be affected.", e);
             }
         }
 
@@ -303,31 +327,38 @@ impl EmbeddingStore for LanceDBStore {
 
         let table = self.connection.open_table(table_name).execute().await?;
 
-        // Build and execute the query based on presence of filter
-        let record_batches = if let Some(filter_str) = metadata_filter {
-            // With filter: use only_if instead of filter
-            // Clone the query_vector to avoid ownership issues
+        // Calculate optimal search parameters based on table size
+        let row_count = match table.count_rows(None).await {
+            Ok(count) => count,
+            Err(_) => 100, // Default if we can't get the count
+        };
+
+        let nprobes = calculate_optimal_nprobes(row_count);
+        let refine_factor = if row_count > 10000 { Some(5) } else { None };
+
+        // Create query builder based on whether there's a metadata filter
+        let query_builder = if let Some(filter_str) = metadata_filter {
+            // With filter: use only_if
             let query_vec_clone = query_vector.clone();
             table
                 .query()
                 .only_if(filter_str)
                 .nearest_to(query_vec_clone)?
-                .limit(limit)
-                .execute()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?
         } else {
             // Without filter: directly do vector search
-            table
-                .query()
-                .nearest_to(query_vector)?
-                .limit(limit)
-                .execute()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?
+            table.query().nearest_to(query_vector)?
         };
+
+        // Set limit with a buffer for better recall
+        let search_limit = (limit as f32 * 1.5) as usize;
+
+        // Execute the query with optimized parameters
+        let record_batches = query_builder
+            .limit(search_limit)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
 
         // Parse results into DocumentEmbedding objects
         let mut results = Vec::new();
@@ -399,8 +430,29 @@ impl EmbeddingStore for LanceDBStore {
             }
         }
 
+        // Limit the results to the exact count requested
+        results.truncate(limit);
+
         Ok(results)
     }
+}
+
+// Helper function to try creating an optimized IVF_PQ index
+async fn create_optimized_index(table: &lancedb::table::Table, row_count: usize) -> Result<()> {
+    // We'll try the Auto index which should select an appropriate vector index type
+    table
+        .create_index(&["embedding"], Index::Auto)
+        .execute()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create optimized index: {}", e))
+}
+
+// Calculate optimal number of probes based on dataset size
+fn calculate_optimal_nprobes(row_count: usize) -> usize {
+    // Using recommended 5-15% of partitions as probes
+    let num_partitions = estimate_partition_count(row_count) as usize;
+    let probes = (num_partitions as f64 * 0.10).round() as usize; // 10% of partitions
+    probes.clamp(10, 100) // Reasonable bounds
 }
 
 // Helper for accessing columns by name

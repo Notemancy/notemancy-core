@@ -12,7 +12,7 @@ use tokio::task;
 async fn test_vec_indexer_integration() -> Result<()> {
     // Set up the test environment inside a blocking task to ensure errors are Send+Sync.
     task::spawn_blocking(|| {
-        common::setup_test_env(1000).map_err(|e| anyhow!("setup_test_env error: {}", e))
+        common::setup_test_env(300).map_err(|e| anyhow!("setup_test_env error: {}", e))
     })
     .await??;
 

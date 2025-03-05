@@ -3,15 +3,34 @@
 use crate::ai::AI;
 use crate::db::Database;
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 use tokio::task;
 
 const SIMILARITY_THRESHOLD: f32 = 0.1; // Similarity threshold (adjust as needed)
 const MAX_RESULTS: usize = 20;
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(2); // Update progress every 2 seconds
+const BATCH_SIZE: usize = 100; // Process files in batches for better progress reporting
+
+// Structure to hold file information and content
+struct FileInfo {
+    id: String,
+    content: String,
+    metadata: HashMap<String, String>,
+    path: String,
+}
 
 pub async fn index_markdown_files(ai: &AI) -> Result<()> {
+    let start_time = Instant::now();
+
     // Wrap blocking DB operations using spawn_blocking
     let file_records = task::spawn_blocking(|| {
         let db = Database::new().map_err(|e| anyhow!("Database initialization error: {}", e))?;
@@ -22,41 +41,171 @@ pub async fn index_markdown_files(ai: &AI) -> Result<()> {
     .map_err(|e| anyhow!("Task join error: {}", e))??;
 
     // Track which physical paths we've indexed in this run to prevent duplicates
+    let mut markdown_files = Vec::new();
     let mut indexed_paths = std::collections::HashSet::new();
 
-    // Process each file record
+    // First pass: collect all valid markdown files to process
     for record in file_records {
-        if record.path.ends_with(".md") || record.path.ends_with(".markdown") {
-            // Skip if we've already indexed this physical path in this run
-            if !indexed_paths.insert(record.path.clone()) {
-                continue;
-            }
-
-            // Read the file content in a blocking thread
-            let path = record.path.clone();
-            let path_for_error = path.clone();
-            let content = task::spawn_blocking(move || fs::read_to_string(&path))
-                .await
-                .map_err(|e| anyhow!("Task join error: {}", e))?
-                .map_err(|e| anyhow!("Failed to read file {}: {}", path_for_error, e))?;
-
-            // Build a metadata map using available record data
-            let mut metadata = HashMap::new();
-            metadata.insert("physical_path".to_string(), record.path.clone());
-            metadata.insert("virtual_path".to_string(), record.virtual_path.clone());
-            metadata.insert("record_metadata".to_string(), record.metadata.clone());
-
-            // Use a more unique ID format that includes both virtual path and physical path
-            // This helps ensure we don't get ID collisions while maintaining uniqueness for physical paths
-            let id = format!("{}|{}", record.virtual_path, record.path);
-
-            // Try to delete any existing embedding with this ID first (ignore errors if not found)
-            let _ = ai.delete_document_embedding(&id).await;
-
-            // Generate and store the embedding
-            ai.store_document_embedding(&id, &content, metadata).await?;
+        if (record.path.ends_with(".md") || record.path.ends_with(".markdown"))
+            && indexed_paths.insert(record.path.clone())
+        {
+            markdown_files.push(record);
         }
     }
+
+    let total_files = markdown_files.len();
+    println!("Starting to index {} markdown files", total_files);
+
+    if total_files == 0 {
+        println!("No markdown files found to index");
+        return Ok(());
+    }
+
+    // Counters for progress tracking
+    let processed_count = Arc::new(AtomicUsize::new(0));
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let error_count = Arc::new(AtomicUsize::new(0));
+
+    // Spawn a background task to periodically report progress
+    let progress_processed = processed_count.clone();
+    let progress_success = success_count.clone();
+    let progress_error = error_count.clone();
+    let progress_handle = tokio::spawn(async move {
+        let mut last_update = Instant::now();
+        let mut last_processed = 0;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let current = progress_processed.load(Ordering::Relaxed);
+            let successes = progress_success.load(Ordering::Relaxed);
+            let errors = progress_error.load(Ordering::Relaxed);
+
+            // Check if all files have been processed
+            if current >= total_files {
+                let elapsed = start_time.elapsed();
+                let files_per_second = if elapsed.as_secs() > 0 {
+                    total_files as f64 / elapsed.as_secs() as f64
+                } else {
+                    total_files as f64
+                };
+
+                println!("\rIndexing complete: {} files processed ({} succeeded, {} failed) in {:.1?} ({:.1} files/sec)",
+                    total_files, successes, errors, elapsed, files_per_second);
+                break;
+            }
+
+            // Update progress at regular intervals or if significant progress was made
+            if last_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
+                || (current - last_processed) > total_files / 20
+            {
+                let elapsed = start_time.elapsed();
+                let percent = (current as f64 / total_files as f64) * 100.0;
+                let files_per_second = if elapsed.as_secs() > 0 {
+                    current as f64 / elapsed.as_secs() as f64
+                } else {
+                    current as f64
+                };
+
+                let eta = if files_per_second > 0.0 {
+                    let remaining_files = total_files - current;
+                    let seconds_left = remaining_files as f64 / files_per_second;
+                    format!("ETA: {:.0?}", Duration::from_secs_f64(seconds_left))
+                } else {
+                    "ETA: calculating...".to_string()
+                };
+
+                println!(
+                    "\rIndexing progress: {}/{} files ({:.1}%) - {} - {:.1} files/sec",
+                    current, total_files, percent, eta, files_per_second
+                );
+
+                last_update = Instant::now();
+                last_processed = current;
+            }
+        }
+    });
+
+    // Step 1: Read files in parallel using Rayon
+    println!(
+        "Starting parallel file reading with {} threads",
+        rayon::current_num_threads()
+    );
+
+    // Process files in batches
+    for chunk in markdown_files.chunks(BATCH_SIZE) {
+        // Use Rayon to read files in parallel
+        let file_infos: Vec<Result<FileInfo>> = chunk
+            .par_iter()
+            .map(|record| {
+                let path = record.path.clone();
+
+                // Read file content
+                match fs::read_to_string(&path) {
+                    Ok(content) => {
+                        // Build metadata map
+                        let mut metadata = HashMap::new();
+                        metadata.insert("physical_path".to_string(), record.path.clone());
+                        metadata.insert("virtual_path".to_string(), record.virtual_path.clone());
+                        metadata.insert("record_metadata".to_string(), record.metadata.clone());
+
+                        // Use a more unique ID format
+                        let id = format!("{}|{}", record.virtual_path, record.path);
+
+                        Ok(FileInfo {
+                            id,
+                            content,
+                            metadata,
+                            path: path.clone(),
+                        })
+                    }
+                    Err(e) => Err(anyhow!("Failed to read file {}: {}", path, e)),
+                }
+            })
+            .collect();
+
+        // Step 2: Process each file info (async operations)
+        for file_result in file_infos {
+            match file_result {
+                Ok(file_info) => {
+                    // Delete any existing embedding first
+                    let _ = ai.delete_document_embedding(&file_info.id).await;
+
+                    // Generate and store embedding
+                    match ai
+                        .store_document_embedding(
+                            &file_info.id,
+                            &file_info.content,
+                            file_info.metadata,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            success_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            eprintln!("Error storing embedding for {}: {}", file_info.path, e);
+                            error_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error processing file: {}", e);
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Increment processed count regardless of success/failure
+            processed_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Wait for the progress reporter to finish
+    let _ = progress_handle.await;
+
+    let elapsed = start_time.elapsed();
+    println!("Indexing completed in {:.2?}", elapsed);
+
     Ok(())
 }
 
