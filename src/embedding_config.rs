@@ -22,7 +22,7 @@ pub struct EmbeddingConfig {
 
 // Default values for embedding configuration
 fn default_embedding_dim() -> usize {
-    384 // Common dimension for models like all-MiniLM-L6-v2
+    768 // Common dimension for models like all-MiniLM-L6-v2
 }
 
 fn default_db_dir() -> String {

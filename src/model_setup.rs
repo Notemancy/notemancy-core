@@ -13,7 +13,7 @@ pub async fn ensure_model_available() -> Result<()> {
         config::get_config_dir().map_err(|e| anyhow!("Failed to get config directory: {}", e))?;
 
     // Model name - hardcoded since we only support one model
-    let model_name = "all-MiniLM-L6-v2";
+    let model_name = "paraphrase-albert-small-v2";
     let model_path = config_dir.join(model_name);
 
     // If the model directory doesn't exist, create it and download the model
@@ -43,9 +43,10 @@ fn download_model(model_path: &Path) -> Result<()> {
 
     // Download the model - this will cache it in the rust-bert default location
     // Here we use the correct enum value instead of a string
-    let _temp_model = SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL6V2)
-        .create_model()
-        .map_err(|e| anyhow!("Failed to download model: {}", e))?;
+    let _temp_model =
+        SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::ParaphraseAlbertSmallV2)
+            .create_model()
+            .map_err(|e| anyhow!("Failed to download model: {}", e))?;
 
     // Now find where rust-bert cached it - we know it's in the default cache location
 
@@ -69,7 +70,7 @@ fn download_model(model_path: &Path) -> Result<()> {
     };
 
     let model_cache_path = cache_dir
-        .join("models--sentence-transformers--all-MiniLM-L6-v2")
+        .join("models--sentence-transformers--paraphrase-albert-small-v2")
         .join("snapshots");
 
     // Find the snapshot directory (should have a hash as its name)
@@ -133,7 +134,7 @@ pub fn print_manual_download_instructions() {
     println!("2. Download all files from the repository");
 
     if let Ok(model_path) = config::get_config_dir() {
-        let model_dir = model_path.join("all-MiniLM-L6-v2");
+        let model_dir = model_path.join("paraphrase-albert-small-v2");
         println!("3. Create the directory: {:?}", model_dir);
         println!("4. Place all downloaded files in this directory");
     } else {

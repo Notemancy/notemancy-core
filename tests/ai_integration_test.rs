@@ -11,7 +11,7 @@ async fn test_basic_embedding_flow() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if the model exists in the config directory
     let config_dir = notemancy_core::config::get_config_dir()?;
-    let model_dir = config_dir.join("all-MiniLM-L6-v2");
+    let model_dir = config_dir.join("paraphrase-albert-small-v2");
 
     if !model_exists(&model_dir) {
         println!("=================================================================");
@@ -41,7 +41,7 @@ async fn test_basic_embedding_flow() -> Result<(), Box<dyn std::error::Error>> {
     let embedding = ai.generate_embedding(test_text)?;
 
     // Verify embedding dimension (all-MiniLM-L6-v2 produces 384-dimensional vectors)
-    assert_eq!(embedding.len(), 384);
+    assert_eq!(embedding.len(), 768);
     println!(
         "Successfully generated embedding with dimension: {}",
         embedding.len()

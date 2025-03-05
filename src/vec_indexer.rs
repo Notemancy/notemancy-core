@@ -1,10 +1,8 @@
-// src/doc_indexer.rs
+// src/vec_indexer.rs
 
 use crate::ai::AI;
 use crate::db::Database;
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -18,27 +16,15 @@ use tokio::task;
 const SIMILARITY_THRESHOLD: f32 = 0.1; // Similarity threshold (adjust as needed)
 const MAX_RESULTS: usize = 20;
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(2); // Update progress every 2 seconds
-const BATCH_SIZE: usize = 100; // Process files in batches for better progress reporting
-
-// Structure to hold file information and content
-struct FileInfo {
-    id: String,
-    content: String,
-    metadata: HashMap<String, String>,
-    path: String,
-}
 
 pub async fn index_markdown_files(ai: &AI) -> Result<()> {
     let start_time = Instant::now();
 
-    // Wrap blocking DB operations using spawn_blocking
-    let file_records = task::spawn_blocking(|| {
-        let db = Database::new().map_err(|e| anyhow!("Database initialization error: {}", e))?;
-        db.get_file_tree()
-            .map_err(|e| anyhow!("Error fetching file tree: {}", e))
-    })
-    .await
-    .map_err(|e| anyhow!("Task join error: {}", e))??;
+    // Get file records from database
+    let db = Database::new().map_err(|e| anyhow!("Database initialization error: {}", e))?;
+    let file_records = db
+        .get_file_tree()
+        .map_err(|e| anyhow!("Error fetching file tree: {}", e))?;
 
     // Track which physical paths we've indexed in this run to prevent duplicates
     let mut markdown_files = Vec::new();
@@ -54,7 +40,10 @@ pub async fn index_markdown_files(ai: &AI) -> Result<()> {
     }
 
     let total_files = markdown_files.len();
-    println!("Starting to index {} markdown files", total_files);
+    println!(
+        "Starting to index {} markdown files (SERIAL MODE)",
+        total_files
+    );
 
     if total_files == 0 {
         println!("No markdown files found to index");
@@ -126,85 +115,56 @@ pub async fn index_markdown_files(ai: &AI) -> Result<()> {
         }
     });
 
-    // Step 1: Read files in parallel using Rayon
-    println!(
-        "Starting parallel file reading with {} threads",
-        rayon::current_num_threads()
-    );
+    // Process files serially
+    println!("Starting serial file processing");
 
-    // Process files in batches
-    for chunk in markdown_files.chunks(BATCH_SIZE) {
-        // Use Rayon to read files in parallel
-        let file_infos: Vec<Result<FileInfo>> = chunk
-            .par_iter()
-            .map(|record| {
-                let path = record.path.clone();
+    // Process each file one at a time
+    for record in markdown_files {
+        let path = &record.path;
 
-                // Read file content
-                match fs::read_to_string(&path) {
-                    Ok(content) => {
-                        // Build metadata map
-                        let mut metadata = HashMap::new();
-                        metadata.insert("physical_path".to_string(), record.path.clone());
-                        metadata.insert("virtual_path".to_string(), record.virtual_path.clone());
-                        metadata.insert("record_metadata".to_string(), record.metadata.clone());
-
-                        // Use a more unique ID format
-                        let id = format!("{}|{}", record.virtual_path, record.path);
-
-                        Ok(FileInfo {
-                            id,
-                            content,
-                            metadata,
-                            path: path.clone(),
-                        })
-                    }
-                    Err(e) => Err(anyhow!("Failed to read file {}: {}", path, e)),
-                }
-            })
-            .collect();
-
-        // Step 2: Process each file info (async operations)
-        for file_result in file_infos {
-            match file_result {
-                Ok(file_info) => {
-                    // Delete any existing embedding first
-                    let _ = ai.delete_document_embedding(&file_info.id).await;
-
-                    // Generate and store embedding
-                    match ai
-                        .store_document_embedding(
-                            &file_info.id,
-                            &file_info.content,
-                            file_info.metadata,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            success_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            eprintln!("Error storing embedding for {}: {}", file_info.path, e);
-                            error_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error processing file: {}", e);
-                    error_count.fetch_add(1, Ordering::Relaxed);
-                }
+        // Read file content
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Failed to read file {}: {}", path, e);
+                error_count.fetch_add(1, Ordering::Relaxed);
+                processed_count.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
+        };
 
-            // Increment processed count regardless of success/failure
-            processed_count.fetch_add(1, Ordering::Relaxed);
+        // Build metadata map
+        let mut metadata = HashMap::new();
+        metadata.insert("physical_path".to_string(), record.path.clone());
+        metadata.insert("virtual_path".to_string(), record.virtual_path.clone());
+        metadata.insert("record_metadata".to_string(), record.metadata.clone());
+
+        // Use a more unique ID format
+        let id = format!("{}|{}", record.virtual_path, record.path);
+
+        // Delete any existing embedding first
+        let _ = ai.delete_document_embedding(&id).await;
+
+        // Generate and store embedding
+        match ai.store_document_embedding(&id, &content, metadata).await {
+            Ok(_) => {
+                success_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                eprintln!("Error storing embedding for {}: {}", path, e);
+                error_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
+
+        // Increment processed count
+        processed_count.fetch_add(1, Ordering::Relaxed);
     }
 
     // Wait for the progress reporter to finish
     let _ = progress_handle.await;
 
     let elapsed = start_time.elapsed();
-    println!("Indexing completed in {:.2?}", elapsed);
+    println!("Serial indexing completed in {:.2?}", elapsed);
 
     Ok(())
 }

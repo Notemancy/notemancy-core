@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Connection, DistanceType};
+use lancedb::{connect, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
