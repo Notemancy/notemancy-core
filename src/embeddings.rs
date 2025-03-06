@@ -1,483 +1,363 @@
-use anyhow::{Context, Result};
-use arrow_array::Array;
-use arrow_array::{
-    types::Float32Type, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch,
-    RecordBatchIterator, StringArray,
-};
-use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
-use futures::TryStreamExt;
-use lancedb::index::Index;
-use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Connection};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+// embeddings.rs
+use std::path::PathBuf;
 use std::sync::Arc;
 
-/// A struct to represent document embeddings with metadata
+use arrow_array::types::Float32Type;
+use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures::TryStreamExt;
+use serde::{Deserialize, Serialize};
+
+use lancedb::{
+    connect,
+    index::vector::IvfPqIndexBuilder,
+    index::Index,
+    query::{ExecutableQuery, QueryBase},
+    Connection, DistanceType, Error, Result, Table,
+};
+
+use crate::config;
+
+const EMBEDDING_DIM: usize = 768;
+const TABLE_NAME: &str = "embeddings";
+
+/// Metadata associated with an embedding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingMetadata {
+    /// Unique identifier for the embedding.
+    pub id: String,
+    /// Title or name of the document.
+    pub title: String,
+    /// Filesystem path or URI to the source document.
+    pub path: String,
+}
+
+/// A document embedding with its metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentEmbedding {
-    /// Unique identifier for the embedding
-    pub id: String,
-    /// The embedding vector
-    pub embedding: Vec<f32>,
-    /// Metadata associated with this embedding
-    pub metadata: HashMap<String, String>,
+    /// The embedding vector.
+    pub vector: Vec<f32>,
+    /// Metadata for the embedding.
+    pub metadata: EmbeddingMetadata,
 }
 
-/// Configuration for the embedding database
-#[derive(Debug, Clone)]
-pub struct EmbeddingStoreConfig {
-    /// Path to the database
-    pub db_path: String,
-    /// Dimension of the embeddings
-    pub embedding_dim: usize,
-}
-
-/// A trait defining the operations for an embedding store
-#[async_trait]
-pub trait EmbeddingStore {
-    /// Initialize a new connection to the embedding store
-    async fn connect(config: EmbeddingStoreConfig) -> Result<Self>
-    where
-        Self: Sized;
-
-    /// Create a new embedding table
-    async fn create_table(&self, table_name: &str) -> Result<()>;
-
-    /// Drop an existing embedding table
-    async fn drop_table(&self, table_name: &str) -> Result<()>;
-
-    /// Check if a table exists
-    async fn table_exists(&self, table_name: &str) -> Result<bool>;
-
-    /// Add embeddings to a table
-    async fn add_embeddings(
-        &self,
-        table_name: &str,
-        embeddings: Vec<DocumentEmbedding>,
-    ) -> Result<()>;
-
-    /// Delete embeddings by their IDs
-    async fn delete_embeddings(&self, table_name: &str, ids: Vec<String>) -> Result<()>;
-
-    /// Find similar embeddings using vector similarity search
-    async fn similarity_search(
-        &self,
-        table_name: &str,
-        query_vector: Vec<f32>,
-        limit: usize,
-        metadata_filter: Option<&str>,
-    ) -> Result<Vec<(DocumentEmbedding, f32)>>;
-}
-
-/// Implementation of the EmbeddingStore trait using LanceDB
-pub struct LanceDBStore {
+/// Manager for storing and retrieving embeddings.
+pub struct EmbeddingsStore {
     connection: Connection,
-    embedding_dim: usize,
+    table: Option<Table>,
 }
 
-// Helper to estimate optimal partitions based on dataset size
-fn estimate_partition_count(row_count: usize) -> u32 {
-    // Common practice is to have sqrt(n) partitions for optimal balance
-    // Apply reasonable min/max bounds
-    let sqrt = (row_count as f64).sqrt().round() as u32;
-    sqrt.clamp(10, 1000)
-}
+impl EmbeddingsStore {
+    /// Create a new embeddings store.
+    ///
+    /// This function uses the config module to determine the database directory.
+    pub async fn new() -> Result<Self> {
+        // Get the config directory or default to "./data"
+        let config_dir = config::get_config_dir().unwrap_or_else(|_| PathBuf::from("./data"));
+        // Create embeddings directory under the config directory
+        let embeddings_dir = config_dir.join("embeddings");
+        if !embeddings_dir.exists() {
+            std::fs::create_dir_all(&embeddings_dir).map_err(|e| Error::Other {
+                message: format!("Failed to create embeddings directory: {}", e),
+                source: None,
+            })?;
+        }
 
-#[async_trait]
-impl EmbeddingStore for LanceDBStore {
-    async fn connect(config: EmbeddingStoreConfig) -> Result<Self> {
-        let connection = connect(&config.db_path)
-            .execute()
-            .await
-            .context("Failed to connect to LanceDB")?;
-
-        Ok(Self {
+        // Connect to the LanceDB instance at the embeddings directory.
+        let connection = connect(&embeddings_dir.to_string_lossy()).execute().await?;
+        let mut store = Self {
             connection,
-            embedding_dim: config.embedding_dim,
-        })
+            table: None,
+        };
+
+        // If the table exists, open it.
+        let tables = store.connection.table_names().execute().await?;
+        if tables.contains(&TABLE_NAME.to_string()) {
+            store.table = Some(store.connection.open_table(TABLE_NAME).execute().await?);
+        }
+        Ok(store)
     }
 
-    async fn create_table(&self, table_name: &str) -> Result<()> {
-        // First check if the table already exists
-        if self.table_exists(table_name).await? {
+    /// Check if the embeddings table exists.
+    pub async fn table_exists(&self) -> Result<bool> {
+        let tables = self.connection.table_names().execute().await?;
+        Ok(tables.contains(&TABLE_NAME.to_string()))
+    }
+
+    /// Create a new table with the fixed schema.
+    pub async fn create_table(&mut self) -> Result<()> {
+        if self.table_exists().await? {
+            self.table = Some(self.connection.open_table(TABLE_NAME).execute().await?);
             return Ok(());
         }
 
-        // Define the schema for the embedding table
+        // Define the schema with a hard-coded embedding dimension.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("path", DataType::Utf8, true),
             Field::new(
-                "embedding",
+                "vector",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
-                    self.embedding_dim as i32,
+                    EMBEDDING_DIM as i32,
                 ),
                 true,
             ),
-            // Add a field for metadata as JSON
-            Field::new("metadata_json", DataType::Utf8, true),
         ]));
 
-        // Create an empty batch with the schema
+        // Create an empty record batch.
         let empty_batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(Vec::<&str>::new())),
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+                Arc::new(StringArray::from(Vec::<&str>::new())),
                 Arc::new(
                     FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                         Vec::<Option<Vec<Option<f32>>>>::new(),
-                        self.embedding_dim as i32,
+                        EMBEDDING_DIM as i32,
                     ),
                 ),
-                Arc::new(StringArray::from(Vec::<&str>::new())),
             ],
         )?;
 
+        // Create a batch iterator and create the table.
         let batches =
             RecordBatchIterator::new(vec![empty_batch].into_iter().map(Ok), schema.clone());
-
-        self.connection
-            .create_table(table_name, Box::new(batches))
+        let table = self
+            .connection
+            .create_table(TABLE_NAME, Box::new(batches))
             .execute()
-            .await
-            .context("Failed to create table")?;
+            .await?;
 
-        // We don't create an index here since the table is empty
-        // Index will be created when data is added
-
+        self.table = Some(table);
         Ok(())
     }
 
-    async fn drop_table(&self, table_name: &str) -> Result<()> {
-        self.connection
-            .drop_table(table_name)
-            .await
-            .context("Failed to drop table")?;
+    /// Add a single document embedding to the store.
+    pub async fn add_embedding(&self, embedding: DocumentEmbedding) -> Result<()> {
+        let table = self.table.as_ref().ok_or(Error::Other {
+            message: "Table not initialized".to_string(),
+            source: None,
+        })?;
+
+        if embedding.vector.len() != EMBEDDING_DIM {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "Embedding vector dimension {} does not match expected {}",
+                    embedding.vector.len(),
+                    EMBEDDING_DIM
+                ),
+            });
+        }
+
+        let id = Arc::new(StringArray::from(vec![embedding.metadata.id]));
+        let title = Arc::new(StringArray::from(vec![embedding.metadata.title]));
+        let path = Arc::new(StringArray::from(vec![embedding.metadata.path]));
+        let vector = Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                vec![Some(
+                    embedding.vector.into_iter().map(Some).collect::<Vec<_>>(),
+                )],
+                EMBEDDING_DIM as i32,
+            ),
+        );
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", id as ArrayRef),
+            ("title", title as ArrayRef),
+            ("path", path as ArrayRef),
+            ("vector", vector as ArrayRef),
+        ])?;
+
+        let schema_ref: SchemaRef = batch.schema();
+        let iter = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema_ref);
+        table.add(Box::new(iter)).execute().await?;
         Ok(())
     }
 
-    async fn table_exists(&self, table_name: &str) -> Result<bool> {
-        let tables = self.connection.table_names().execute().await?;
-        Ok(tables.contains(&table_name.to_string()))
-    }
-
-    async fn add_embeddings(
-        &self,
-        table_name: &str,
-        embeddings: Vec<DocumentEmbedding>,
-    ) -> Result<()> {
+    /// Add multiple document embeddings to the store.
+    pub async fn add_embeddings(&self, embeddings: Vec<DocumentEmbedding>) -> Result<()> {
         if embeddings.is_empty() {
             return Ok(());
         }
 
-        // Ensure the table exists
-        let table_existed = self.table_exists(table_name).await?;
-        if !table_existed {
-            self.create_table(table_name).await?;
-        }
+        let table = self.table.as_ref().ok_or(Error::Other {
+            message: "Table not initialized".to_string(),
+            source: None,
+        })?;
 
-        let table = self.connection.open_table(table_name).execute().await?;
-
-        // Prepare the data for insertion
-        let ids: Vec<&str> = embeddings.iter().map(|e| e.id.as_str()).collect();
-
-        // Prepare the embeddings
-        let embedding_vectors: Vec<Option<Vec<Option<f32>>>> = embeddings
-            .iter()
-            .map(|e| {
-                // Validate that the embedding has the correct dimension
-                if e.embedding.len() != self.embedding_dim {
-                    None
-                } else {
-                    Some(e.embedding.iter().map(|&v| Some(v)).collect())
-                }
-            })
-            .collect();
-
-        // Serialize metadata to JSON strings
-        let metadata_json: Vec<String> = embeddings
-            .iter()
-            .map(|e| serde_json::to_string(&e.metadata).unwrap_or_else(|_| "{}".to_string()))
-            .collect();
-
-        let metadata_refs: Vec<&str> = metadata_json.iter().map(|s| s.as_str()).collect();
-
-        // Create schema and record batch
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new(
-                "embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    self.embedding_dim as i32,
-                ),
-                true,
-            ),
-            Field::new("metadata_json", DataType::Utf8, true),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(
-                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                        embedding_vectors,
-                        self.embedding_dim as i32,
+        // Validate that all vectors have the correct dimension.
+        for emb in &embeddings {
+            if emb.vector.len() != EMBEDDING_DIM {
+                return Err(Error::InvalidInput {
+                    message: format!(
+                        "Embedding vector dimension {} does not match expected {}",
+                        emb.vector.len(),
+                        EMBEDDING_DIM
                     ),
-                ),
-                Arc::new(StringArray::from(metadata_refs)),
-            ],
-        )?;
-
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-
-        // Add the data to the table
-        table
-            .add(Box::new(batches))
-            .execute()
-            .await
-            .context("Failed to add embeddings to table")?;
-
-        // If this is the first time adding data, create a vector index
-        if !table_existed {
-            // Sleep for a very short time to ensure data is committed
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            // Get a rough estimate of table size for configuring optimal partitions
-            let row_count = match table.count_rows(None).await {
-                Ok(count) => count,
-                Err(_) => 100, // Default if we can't get the count
-            };
-
-            // Try creating an IVF_PQ index which is optimized for ANN search
-            // If this fails, fall back to Auto index
-            let index_result = match create_optimized_index(&table, row_count).await {
-                Ok(_) => {
-                    println!("Created optimized IVF_PQ vector index for faster ANN search");
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to create optimized index: {}. Falling back to Auto index.", e);
-
-                    // Fallback to Auto index
-                    table
-                        .create_index(&["embedding"], Index::Auto)
-                        .execute()
-                        .await
-                }
-            };
-
-            // Log if even the fallback failed
-            if let Err(e) = index_result {
-                eprintln!("Warning: Failed to create any vector index: {}. Search performance may be affected.", e);
+                });
             }
         }
 
+        let ids: Vec<&str> = embeddings.iter().map(|e| e.metadata.id.as_str()).collect();
+        let titles: Vec<&str> = embeddings
+            .iter()
+            .map(|e| e.metadata.title.as_str())
+            .collect();
+        let paths: Vec<&str> = embeddings
+            .iter()
+            .map(|e| e.metadata.path.as_str())
+            .collect();
+        let vectors: Vec<Option<Vec<Option<f32>>>> = embeddings
+            .iter()
+            .map(|e| Some(e.vector.iter().map(|&v| Some(v)).collect()))
+            .collect();
+
+        let id_array = Arc::new(StringArray::from(ids));
+        let title_array = Arc::new(StringArray::from(titles));
+        let path_array = Arc::new(StringArray::from(paths));
+        let vector_array = Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                vectors,
+                EMBEDDING_DIM as i32,
+            ),
+        );
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("id", id_array as ArrayRef),
+            ("title", title_array as ArrayRef),
+            ("path", path_array as ArrayRef),
+            ("vector", vector_array as ArrayRef),
+        ])?;
+
+        let schema_ref: SchemaRef = batch.schema();
+        let iter = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema_ref);
+        table.add(Box::new(iter)).execute().await?;
         Ok(())
     }
 
-    async fn delete_embeddings(&self, table_name: &str, ids: Vec<String>) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
+    /// Create an approximate nearest neighbor (ANN) index for faster vector search.
+    pub async fn create_index(&self) -> Result<()> {
+        let table = self.table.as_ref().ok_or(Error::Other {
+            message: "Table not initialized".to_string(),
+            source: None,
+        })?;
 
-        // Ensure the table exists
-        if !self.table_exists(table_name).await? {
-            return Ok(());
-        }
-
-        let table = self.connection.open_table(table_name).execute().await?;
-
-        // Build the SQL filter for deleting records with the specified IDs
-        let ids_formatted: Vec<String> = ids.iter().map(|id| format!("'{}'", id)).collect();
-        let filter = format!("id IN ({})", ids_formatted.join(","));
-
-        // Execute the delete operation
         table
-            .delete(filter.as_str())
-            .await
-            .context("Failed to delete embeddings")?;
-
+            .create_index(
+                &["vector"],
+                Index::IvfPq(
+                    IvfPqIndexBuilder::default()
+                        .distance_type(DistanceType::Cosine)
+                        .num_partitions(5)
+                        .num_sub_vectors(16),
+                ),
+            )
+            .execute()
+            .await?;
         Ok(())
     }
 
-    async fn similarity_search(
+    /// Search for similar embeddings.
+    pub async fn search(
         &self,
-        table_name: &str,
-        query_vector: Vec<f32>,
+        query_vector: &[f32],
         limit: usize,
-        metadata_filter: Option<&str>,
-    ) -> Result<Vec<(DocumentEmbedding, f32)>> {
-        // Ensure the table exists
-        if !self.table_exists(table_name).await? {
-            return Ok(Vec::new());
+    ) -> Result<Vec<DocumentEmbedding>> {
+        let table = self.table.as_ref().ok_or(Error::Other {
+            message: "Table not initialized".to_string(),
+            source: None,
+        })?;
+
+        if query_vector.len() != EMBEDDING_DIM {
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "Query vector dimension {} does not match expected {}",
+                    query_vector.len(),
+                    EMBEDDING_DIM
+                ),
+            });
         }
 
-        // Verify query vector has the correct dimension
-        if query_vector.len() != self.embedding_dim {
-            return Err(anyhow::anyhow!(
-                "Query vector dimension ({}) does not match the expected dimension ({})",
-                query_vector.len(),
-                self.embedding_dim
-            ));
-        }
-
-        let table = self.connection.open_table(table_name).execute().await?;
-
-        // Calculate optimal search parameters based on table size
-        let row_count = match table.count_rows(None).await {
-            Ok(count) => count,
-            Err(_) => 100, // Default if we can't get the count
-        };
-
-        let nprobes = calculate_optimal_nprobes(row_count);
-        let refine_factor = if row_count > 10000 { Some(5) } else { None };
-
-        // Create query builder based on whether there's a metadata filter
-        let query_builder = if let Some(filter_str) = metadata_filter {
-            // With filter: use only_if
-            let query_vec_clone = query_vector.clone();
-            table
-                .query()
-                .only_if(filter_str)
-                .nearest_to(query_vec_clone)?
-        } else {
-            // Without filter: directly do vector search
-            table.query().nearest_to(query_vector)?
-        };
-
-        // Set limit with a buffer for better recall
-        let search_limit = (limit as f32 * 1.5) as usize;
-
-        // Execute the query with optimized parameters
-        let record_batches = query_builder
-            .limit(search_limit)
+        let mut results = table
+            .vector_search(query_vector)?
+            .distance_type(DistanceType::Cosine)
+            .limit(limit)
             .execute()
-            .await?
-            .try_collect::<Vec<_>>()
             .await?;
 
-        // Parse results into DocumentEmbedding objects
-        let mut results = Vec::new();
-        for batch in record_batches {
-            // Extract data from each row in the batch
+        let mut embeddings = Vec::new();
+        while let Some(batch) = results.try_next().await? {
             for row_idx in 0..batch.num_rows() {
-                // Extract ID
-                let id_array = batch
+                let id = batch
                     .column_by_name("id")
-                    .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-                let id = match id_array {
-                    Some(array) if !array.is_null(row_idx) => array.value(row_idx).to_string(),
-                    _ => continue, // Skip if ID is null or column not found
-                };
+                    .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| Error::Other {
+                        message: "Failed to get id column".to_string(),
+                        source: None,
+                    })?
+                    .value(row_idx)
+                    .to_string();
 
-                // Extract embedding vector
-                let embedding_array = batch
-                    .column_by_name("embedding")
-                    .and_then(|col| col.as_any().downcast_ref::<FixedSizeListArray>());
-                let embedding = match embedding_array {
-                    Some(array) => {
-                        if let Some(values) = array.values().as_any().downcast_ref::<Float32Array>()
-                        {
-                            // Calculate the start index in the flattened values array
-                            let start_idx = row_idx * self.embedding_dim;
-                            let end_idx = start_idx + self.embedding_dim;
-                            // Extract the vector slice
-                            if end_idx <= values.len() {
-                                (start_idx..end_idx).map(|i| values.value(i)).collect()
-                            } else {
-                                Vec::new()
+                let title = batch
+                    .column_by_name("title")
+                    .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| Error::Other {
+                        message: "Failed to get title column".to_string(),
+                        source: None,
+                    })?
+                    .value(row_idx)
+                    .to_string();
+
+                let path = batch
+                    .column_by_name("path")
+                    .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| Error::Other {
+                        message: "Failed to get path column".to_string(),
+                        source: None,
+                    })?
+                    .value(row_idx)
+                    .to_string();
+
+                let vector_col = batch
+                    .column_by_name("vector")
+                    .and_then(|col| col.as_any().downcast_ref::<FixedSizeListArray>())
+                    .ok_or_else(|| Error::Other {
+                        message: "Failed to get vector column".to_string(),
+                        source: None,
+                    })?;
+
+                // Reconstruct the embedding vector.
+                let vector_values: Vec<f32> = (0..EMBEDDING_DIM)
+                    .map(|i| {
+                        let list_value = vector_col.value(row_idx);
+                        if i < list_value.len() {
+                            if let Some(float_array) = list_value
+                                .as_any()
+                                .downcast_ref::<arrow_array::Float32Array>()
+                            {
+                                return float_array.value(i);
                             }
-                        } else {
-                            Vec::new()
                         }
-                    }
-                    None => Vec::new(),
-                };
+                        0.0
+                    })
+                    .collect();
 
-                // Extract metadata
-                let metadata_array = batch
-                    .column_by_name("metadata_json")
-                    .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-                let metadata_json = match metadata_array {
-                    Some(array) if !array.is_null(row_idx) => array.value(row_idx),
-                    _ => "{}", // Default to empty JSON if not found
-                };
-                let metadata: HashMap<String, String> =
-                    serde_json::from_str(metadata_json).unwrap_or_else(|_| HashMap::new());
-
-                // Extract distance score
-                let distance_array = batch
-                    .column_by_name("_distance")
-                    .and_then(|col| col.as_any().downcast_ref::<Float32Array>());
-                let distance = match distance_array {
-                    Some(array) if !array.is_null(row_idx) => array.value(row_idx),
-                    _ => 0.0, // Default to 0.0 if not found
-                };
-
-                // Add to results
-                results.push((
-                    DocumentEmbedding {
-                        id,
-                        embedding,
-                        metadata,
-                    },
-                    distance,
-                ));
+                embeddings.push(DocumentEmbedding {
+                    vector: vector_values,
+                    metadata: EmbeddingMetadata { id, title, path },
+                });
             }
         }
-
-        // Limit the results to the exact count requested
-        results.truncate(limit);
-
-        Ok(results)
+        Ok(embeddings)
     }
 }
 
-// Helper function to try creating an optimized IVF_PQ index
-async fn create_optimized_index(table: &lancedb::table::Table, row_count: usize) -> Result<()> {
-    // We'll try the Auto index which should select an appropriate vector index type
-    table
-        .create_index(&["embedding"], Index::Auto)
-        .execute()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create optimized index: {}", e))
-}
-
-// Calculate optimal number of probes based on dataset size
-fn calculate_optimal_nprobes(row_count: usize) -> usize {
-    // Using recommended 5-15% of partitions as probes
-    let num_partitions = estimate_partition_count(row_count) as usize;
-    let probes = (num_partitions as f64 * 0.10).round() as usize; // 10% of partitions
-    probes.clamp(10, 100) // Reasonable bounds
-}
-
-// Helper for accessing columns by name
-trait RecordBatchExt {
-    fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
-}
-
-impl RecordBatchExt for RecordBatch {
-    fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
-        self.schema()
-            .index_of(name)
-            .ok()
-            .map(|idx| self.column(idx))
-    }
-}
-
-/// Create an embedding store with default configuration
-pub async fn create_embedding_store(
-    db_path: &str,
-    embedding_dim: usize,
-) -> Result<impl EmbeddingStore> {
-    let config = EmbeddingStoreConfig {
-        db_path: db_path.to_string(),
-        embedding_dim,
-    };
-
-    LanceDBStore::connect(config).await
+/// Helper function to create a new embeddings store with a table.
+pub async fn create_store() -> Result<EmbeddingsStore> {
+    let mut store = EmbeddingsStore::new().await?;
+    store.create_table().await?;
+    Ok(store)
 }
