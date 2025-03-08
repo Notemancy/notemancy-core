@@ -1,5 +1,5 @@
 use crate::confapi::get_config_dir;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::fs;
 use std::path::PathBuf;
 

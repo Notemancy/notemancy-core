@@ -1,5 +1,6 @@
 use crate::dbapi::{self, delete_record, get_db_file_path, run_migrations, RecordIdentifier};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -123,6 +124,52 @@ pub fn get_metadata(lpath: &str) -> Result<Option<String>, Box<dyn Error>> {
         }
     }
     Ok(None)
+}
+
+pub fn get_records_by_column(
+    columns: &[&str],
+) -> Result<Vec<HashMap<String, Option<String>>>, Box<dyn Error>> {
+    // List of allowed column names.
+    let allowed = ["id", "lpath", "title", "timestamp", "vpath", "project"];
+    // Validate that each requested column is allowed.
+    for &col in columns {
+        if !allowed.contains(&col) {
+            return Err(format!("Invalid column: {}", col).into());
+        }
+    }
+
+    // If no columns are provided, return an empty vector.
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Ensure migrations have been run.
+    run_migrations()?;
+    let db_file_path = get_db_file_path();
+    let conn = Connection::open(db_file_path)?;
+
+    // Build the query using the specified columns.
+    let query = format!("SELECT {} FROM pagetable", columns.join(", "));
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query([])?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let mut record = HashMap::new();
+        for &col in columns {
+            if col == "id" {
+                // 'id' is stored as an integer.
+                let value: i64 = row.get(col)?;
+                record.insert(col.to_string(), Some(value.to_string()));
+            } else {
+                // Other fields are stored as text; they might be NULL so we use Option<String>.
+                let value: Option<String> = row.get(col)?;
+                record.insert(col.to_string(), value);
+            }
+        }
+        records.push(record);
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
