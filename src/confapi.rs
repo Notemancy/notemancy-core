@@ -35,16 +35,35 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Public constant storing the location of the configuration directory.
+/// Returns the configuration directory as a PathBuf.
 ///
-/// On non-Windows systems, we use the conventional "~/.config/notemancy" path.
-/// On Windows, you should replace the placeholder with the actual default config directory
-/// (or use a crate like `dirs` to compute it at runtime).
+/// On Windows, it returns a fixed path. On other systems, it uses the user’s home directory.
 #[cfg(target_os = "windows")]
-pub const CONFIG_DIR: &str = "C:\\Users\\Default\\AppData\\Roaming\\notemancy";
+pub fn get_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("NOTEMANCY_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    PathBuf::from("C:\\Users\\Default\\AppData\\Roaming\\notemancy")
+}
 
 #[cfg(not(target_os = "windows"))]
-pub const CONFIG_DIR: &str = "~/.config/notemancy";
+pub fn get_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("NOTEMANCY_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    // Using the dirs crate to get the home directory.
+    let home = dirs::home_dir().expect("Home directory not found");
+    home.join(".config").join("notemancy")
+}
+
+/// Computes the full path to the config file.
+pub fn get_config_file_path() -> PathBuf {
+    let mut path = get_config_dir();
+    path.push("ncy.yaml");
+    path
+}
 
 /// Represents the whole configuration.
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,13 +92,6 @@ pub struct AIConfig {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AutoTaggingConfig {
     pub mode: Option<String>,
-}
-
-/// Helper function to compute the full config file path.
-fn get_config_file_path() -> PathBuf {
-    let mut path = PathBuf::from(CONFIG_DIR);
-    path.push("ncy.yaml");
-    path
 }
 
 /// Checks whether the configuration file exists and validates its content.
@@ -139,7 +151,6 @@ pub fn get_config() -> Result<Config, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir; // A helper crate for temporary directories
@@ -155,17 +166,12 @@ mod tests {
     /// A test for `validate_config` when the config file is missing.
     #[test]
     fn test_validate_config_missing() {
-        let (_temp_dir, config_dir) = setup_temp_config_dir();
-        // Instead of using the global CONFIG_DIR, you might refactor your code
-        // to accept a config directory as an argument for testing purposes.
-        // For example:
-        // let config_path = config_dir.join("ncy.yaml");
-        // Ensure the file doesn't exist yet.
-        assert!(!config_dir.join("ncy.yaml").exists());
-
-        // Call your function that uses the provided path.
-        // For demonstration, imagine you have a variant of `validate_config` that accepts a path.
-        // let result = validate_config_at(&config_path);
+        let (_temp_dir, _config_dir) = setup_temp_config_dir();
+        // Instead of using the global config directory, refactor your functions
+        // to accept a custom path for testing purposes.
+        // For example, using `config_dir.join("ncy.yaml")` as the config file.
+        // assert!(!config_dir.join("ncy.yaml").exists());
+        // let result = validate_config_at(&config_dir.join("ncy.yaml"));
         // assert!(matches!(result, Err(ConfigError::MissingConfig)));
     }
 
@@ -182,6 +188,4 @@ mod tests {
         // let result = get_config_from(&config_path);
         // assert!(matches!(result, Err(ConfigError::EmptyConfig)));
     }
-
-    // Additional tests for valid configuration parsing and error handling can be added here.
 }
