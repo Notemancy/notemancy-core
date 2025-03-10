@@ -1,4 +1,3 @@
-// vectordb.rs
 use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -54,9 +53,7 @@ impl EmbeddingsStore {
     ///
     /// This function uses the new confapi module to determine the database directory.
     pub async fn new() -> Result<Self> {
-        // Get the configuration directory using the new confapi module.
         let config_dir = confapi::get_config_dir();
-        // Create embeddings directory under the config directory.
         let embeddings_dir = config_dir.join("embeddings");
         if !embeddings_dir.exists() {
             std::fs::create_dir_all(&embeddings_dir).map_err(|e| Error::Other {
@@ -64,14 +61,12 @@ impl EmbeddingsStore {
                 source: None,
             })?;
         }
-        // Connect to the LanceDB instance at the embeddings directory.
         let connection = connect(&embeddings_dir.to_string_lossy()).execute().await?;
         let mut store = Self {
             connection,
             table: None,
         };
 
-        // If the table exists, open it.
         let tables = store.connection.table_names().execute().await?;
         if tables.contains(&TABLE_NAME.to_string()) {
             store.table = Some(store.connection.open_table(TABLE_NAME).execute().await?);
@@ -92,12 +87,11 @@ impl EmbeddingsStore {
             return Ok(());
         }
 
-        // Define the schema with a new "content" field.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("title", DataType::Utf8, true),
             Field::new("path", DataType::Utf8, true),
-            Field::new("content", DataType::Utf8, true), // new full text field
+            Field::new("content", DataType::Utf8, true),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(
@@ -108,7 +102,6 @@ impl EmbeddingsStore {
             ),
         ]));
 
-        // Create an empty record batch.
         let empty_batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -137,12 +130,42 @@ impl EmbeddingsStore {
         Ok(())
     }
 
-    /// Add a single document embedding to the store.
-    pub async fn add_embedding(&self, embedding: DocumentEmbedding) -> Result<()> {
+    /// Retrieves an existing embedding by its file path.
+    pub async fn get_embedding_by_path(&self, path: &str) -> Result<Option<DocumentEmbedding>> {
+        // Use the full-text search API on the "path" field.
+        // Note: This is a heuristic; ensure that your "path" values are unique enough.
+        let embeddings = self.search_text(path, 10).await?;
+        for emb in embeddings {
+            if emb.metadata.path == path {
+                return Ok(Some(emb));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn delete_embedding_by_path(&self, path: &str) -> Result<()> {
         let table = self.table.as_ref().ok_or(Error::Other {
             message: "Table not initialized".to_string(),
             source: None,
         })?;
+        let predicate = format!("path = '{}'", path);
+        table.delete(&predicate).await?;
+        Ok(())
+    }
+
+    /// Add a single document embedding to the store.
+    ///
+    /// If a record with the same "path" already exists, it is deleted and then the new record is inserted.
+    pub async fn add_embedding(&self, embedding: DocumentEmbedding) -> Result<()> {
+        // Check if a record with the same path exists.
+        if let Some(_) = self
+            .get_embedding_by_path(embedding.metadata.path.as_str())
+            .await?
+        {
+            // Delete the existing record.
+            self.delete_embedding_by_path(embedding.metadata.path.as_str())
+                .await?;
+        }
 
         if embedding.vector.len() != EMBEDDING_DIM {
             return Err(Error::InvalidInput {
@@ -177,7 +200,15 @@ impl EmbeddingsStore {
 
         let schema_ref: SchemaRef = batch.schema();
         let iter = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema_ref);
-        table.add(Box::new(iter)).execute().await?;
+        self.table
+            .as_ref()
+            .ok_or(Error::Other {
+                message: "Table not initialized".to_string(),
+                source: None,
+            })?
+            .add(Box::new(iter))
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -187,61 +218,14 @@ impl EmbeddingsStore {
             return Ok(());
         }
 
-        let table = self.table.as_ref().ok_or(Error::Other {
+        let _table = self.table.as_ref().ok_or(Error::Other {
             message: "Table not initialized".to_string(),
             source: None,
         })?;
 
-        // Validate that all vectors have the correct dimension.
-        for emb in &embeddings {
-            if emb.vector.len() != EMBEDDING_DIM {
-                return Err(Error::InvalidInput {
-                    message: format!(
-                        "Embedding vector dimension {} does not match expected {}",
-                        emb.vector.len(),
-                        EMBEDDING_DIM
-                    ),
-                });
-            }
+        for embedding in embeddings {
+            self.add_embedding(embedding).await?;
         }
-
-        let ids: Vec<&str> = embeddings.iter().map(|e| e.metadata.id.as_str()).collect();
-        let titles: Vec<&str> = embeddings
-            .iter()
-            .map(|e| e.metadata.title.as_str())
-            .collect();
-        let paths: Vec<&str> = embeddings
-            .iter()
-            .map(|e| e.metadata.path.as_str())
-            .collect();
-        let contents: Vec<&str> = embeddings.iter().map(|e| e.content.as_str()).collect(); // new content field
-        let vectors: Vec<Option<Vec<Option<f32>>>> = embeddings
-            .iter()
-            .map(|e| Some(e.vector.iter().map(|&v| Some(v)).collect()))
-            .collect();
-
-        let id_array = Arc::new(StringArray::from(ids));
-        let title_array = Arc::new(StringArray::from(titles));
-        let path_array = Arc::new(StringArray::from(paths));
-        let content_array = Arc::new(StringArray::from(contents));
-        let vector_array = Arc::new(
-            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                vectors,
-                EMBEDDING_DIM as i32,
-            ),
-        );
-
-        let batch = RecordBatch::try_from_iter(vec![
-            ("id", id_array as ArrayRef),
-            ("title", title_array as ArrayRef),
-            ("path", path_array as ArrayRef),
-            ("content", content_array as ArrayRef),
-            ("vector", vector_array as ArrayRef),
-        ])?;
-
-        let schema_ref: SchemaRef = batch.schema();
-        let iter = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema_ref);
-        table.add(Box::new(iter)).execute().await?;
         Ok(())
     }
 
@@ -251,7 +235,6 @@ impl EmbeddingsStore {
             message: "Table not initialized".to_string(),
             source: None,
         })?;
-
         table
             .create_index(
                 &["vector"],
@@ -273,7 +256,6 @@ impl EmbeddingsStore {
             message: "Table not initialized".to_string(),
             source: None,
         })?;
-
         table
             .create_index(&["content"], Index::FTS(FtsIndexBuilder::default()))
             .execute()
