@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -53,7 +52,6 @@ pub fn get_config_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    // Using the dirs crate to get the home directory.
     let home = dirs::home_dir().expect("Home directory not found");
     home.join(".config").join("notemancy")
 }
@@ -68,17 +66,8 @@ pub fn get_config_file_path() -> PathBuf {
 /// Represents the whole configuration.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    /// Vaults is represented as an optional vector of single-key maps.
-    /// Each map key is the vault name and the value is its configuration.
-    pub vaults: Option<Vec<HashMap<String, VaultConfig>>>,
+    pub vault_dir: Option<PathBuf>,
     pub ai: Option<AIConfig>,
-}
-
-/// Represents a vault configuration.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VaultConfig {
-    pub scan_paths: Option<Vec<String>>,
-    pub publish_url: Option<String>,
 }
 
 /// Represents the AI configuration.
@@ -99,7 +88,7 @@ pub struct AutoTaggingConfig {
 /// - If the file does not exist, it creates an empty file and returns a `MissingConfig` error.
 /// - If the file is empty, it returns an `EmptyConfig` error.
 /// - Otherwise, it attempts to deserialize the file into a `Config` struct and
-///   checks that required sections (e.g. the `ai` section) are present.
+///   checks that required sections (e.g. the `ai` section and `vault_dir` field) are present.
 ///
 /// # Errors
 ///
@@ -125,11 +114,34 @@ pub fn validate_config() -> Result<(), ConfigError> {
     // Deserialize the config file.
     let config: Config = serde_yaml::from_str(&content).map_err(ConfigError::YamlError)?;
 
-    // Example validation: ensure that the AI section exists.
-    if config.ai.is_none() {
+    // Validate 'ai' section.
+    if let Some(ai) = config.ai {
+        if ai.semantic_thresh.is_none() {
+            return Err(ConfigError::InvalidConfig(
+                "Missing 'ai.semantic_thresh' field".into(),
+            ));
+        }
+        if let Some(autotagging) = ai.autotagging {
+            if autotagging.mode.is_none() {
+                return Err(ConfigError::InvalidConfig(
+                    "Missing 'ai.autotagging.mode' field".into(),
+                ));
+            }
+        } else {
+            return Err(ConfigError::InvalidConfig(
+                "Missing 'ai.autotagging' section".into(),
+            ));
+        }
+    } else {
         return Err(ConfigError::InvalidConfig("Missing 'ai' section".into()));
     }
-    // (Additional validations for vaults or individual keys can be added here.)
+
+    // Validate 'vault_dir' field.
+    if config.vault_dir.is_none() {
+        return Err(ConfigError::InvalidConfig(
+            "Missing 'vault_dir' field".into(),
+        ));
+    }
 
     Ok(())
 }
@@ -153,7 +165,7 @@ pub fn get_config() -> Result<Config, ConfigError> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use tempfile::TempDir; // A helper crate for temporary directories
+    use tempfile::TempDir;
 
     /// Helper function to simulate the config directory in a temporary location.
     fn setup_temp_config_dir() -> (TempDir, PathBuf) {
@@ -167,12 +179,9 @@ mod tests {
     #[test]
     fn test_validate_config_missing() {
         let (_temp_dir, _config_dir) = setup_temp_config_dir();
-        // Instead of using the global config directory, refactor your functions
-        // to accept a custom path for testing purposes.
-        // For example, using `config_dir.join("ncy.yaml")` as the config file.
-        // assert!(!config_dir.join("ncy.yaml").exists());
-        // let result = validate_config_at(&config_dir.join("ncy.yaml"));
-        // assert!(matches!(result, Err(ConfigError::MissingConfig)));
+        // For testing purposes, refactor your functions to accept a custom config path.
+        // Use something like: let result = validate_config_at(&config_dir.join("ncy.yaml"));
+        // and assert that the error matches ConfigError::MissingConfig.
     }
 
     /// A test for `get_config` when the config file is empty.
@@ -184,8 +193,8 @@ mod tests {
         // Create an empty config file.
         fs::write(&config_path, "").expect("Failed to write empty config file");
 
-        // Similarly, if you have a function that accepts a config path, use that.
-        // let result = get_config_from(&config_path);
+        // For testing, use a function that accepts a config path.
+        // e.g., let result = get_config_from(&config_path);
         // assert!(matches!(result, Err(ConfigError::EmptyConfig)));
     }
 }
