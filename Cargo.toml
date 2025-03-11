@@ -32,6 +32,7 @@ async-trait = "0.1"
 arrow = { version = "53.2", optional = false }
 arrow-array = "53.2"
 arrow-schema = "53.2"
+rust-stemmers = "=1.2.0"
 
 [dev-dependencies]
 tempfile = "3.3"

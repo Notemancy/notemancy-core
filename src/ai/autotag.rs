@@ -87,7 +87,8 @@ ai:
 
         // Ensure the model directory exists.
         // This test assumes that the model in temp/paraphrase-albert-small-v2 is already set up correctly.
-        let model_dir = config_dir.join("paraphrase-albert-small-v2");
+        // let model_dir = config_dir.join("paraphrase-albert-small-v2");
+        let model_dir = config_dir.join("all-MiniLM-L6-v2");
         fs::create_dir_all(&model_dir).expect("Failed to create model directory");
 
         // Now call generate_tags with a sample note.

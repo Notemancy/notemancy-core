@@ -1,6 +1,9 @@
+use crate::dbapi;
 use arrow_array::types::Float32Type;
+
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use chrono::Utc; // <-- Add this at the top of your file.
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -17,7 +20,7 @@ use lancedb::{
 
 use crate::confapi;
 
-const EMBEDDING_DIM: usize = 768;
+const EMBEDDING_DIM: usize = 384;
 const TABLE_NAME: &str = "embeddings";
 
 /// Metadata associated with an embedding.
@@ -153,20 +156,22 @@ impl EmbeddingsStore {
         Ok(())
     }
 
-    /// Add a single document embedding to the store.
-    ///
-    /// If a record with the same "path" already exists, it is deleted and then the new record is inserted.
     pub async fn add_embedding(&self, embedding: DocumentEmbedding) -> Result<()> {
-        // Check if a record with the same path exists.
-        if let Some(_) = self
-            .get_embedding_by_path(embedding.metadata.path.as_str())
-            .await?
-        {
-            // Delete the existing record.
-            self.delete_embedding_by_path(embedding.metadata.path.as_str())
-                .await?;
+        // Check if the record already exists in SQLite.
+        if dbapi::record_exists(embedding.metadata.path.as_str()).map_err(|e| {
+            lancedb::Error::Other {
+                message: format!("SQLite error: {}", e),
+                source: None,
+            }
+        })? {
+            println!(
+                "Record already exists in SQLite, skipping insertion: {}",
+                embedding.metadata.path
+            );
+            return Ok(());
         }
 
+        // Ensure the embedding vector has the expected dimension.
         if embedding.vector.len() != EMBEDDING_DIM {
             return Err(Error::InvalidInput {
                 message: format!(
@@ -177,10 +182,11 @@ impl EmbeddingsStore {
             });
         }
 
-        let id = Arc::new(StringArray::from(vec![embedding.metadata.id]));
-        let title = Arc::new(StringArray::from(vec![embedding.metadata.title]));
-        let path = Arc::new(StringArray::from(vec![embedding.metadata.path]));
-        let content = Arc::new(StringArray::from(vec![embedding.content])); // new content field
+        // Prepare the columns for the record batch.
+        let id = Arc::new(StringArray::from(vec![embedding.metadata.id.clone()]));
+        let title = Arc::new(StringArray::from(vec![embedding.metadata.title.clone()]));
+        let path = Arc::new(StringArray::from(vec![embedding.metadata.path.clone()]));
+        let content = Arc::new(StringArray::from(vec![embedding.content]));
         let vector = Arc::new(
             FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 vec![Some(
@@ -209,6 +215,30 @@ impl EmbeddingsStore {
             .add(Box::new(iter))
             .execute()
             .await?;
+        println!("Added record to LanceDB: {}", embedding.metadata.path);
+
+        // Add the record to SQLite.
+        let timestamp = Utc::now().to_rfc3339();
+        let record = dbapi::Record {
+            lpath: embedding.metadata.path,
+            title: embedding.metadata.title,
+            timestamp,
+            // Adjust vpath as needed. Here we use an empty string if not applicable.
+            vpath: "".to_string(),
+            project: None,
+        };
+        match dbapi::add_record(&record) {
+            Ok(status) => match status {
+                dbapi::AddRecordStatus::Inserted => {
+                    println!("Inserted record into SQLite DB: {}", record.lpath)
+                }
+                dbapi::AddRecordStatus::AlreadyExists => {
+                    println!("Record already exists in SQLite DB: {}", record.lpath)
+                }
+            },
+            Err(e) => eprintln!("Failed to insert record into SQLite DB: {}", e),
+        }
+
         Ok(())
     }
 

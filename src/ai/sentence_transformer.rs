@@ -11,7 +11,8 @@ pub fn generate_embedding(input_text: &str) -> Result<Vec<Vec<f32>>, Box<dyn Err
 
     // Determine the model directory.
     // Since the new AIConfig does not include a model name, we default to "paraphrase-albert-small-v2".
-    let model_dir: PathBuf = config_dir.join("paraphrase-albert-small-v2");
+    // let model_dir: PathBuf = config_dir.join("paraphrase-albert-small-v2");
+    let model_dir: PathBuf = config_dir.join("all-MiniLM-L6-v2");
 
     // Build the model from the computed directory.
     let model =

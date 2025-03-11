@@ -232,6 +232,14 @@ pub fn delete_record(identifier: RecordIdentifier) -> Result<(), DbError> {
     Ok(())
 }
 
+pub fn record_exists(path: &str) -> Result<bool, DbError> {
+    let db_file_path = get_db_file_path();
+    let conn = rusqlite::Connection::open(db_file_path)?;
+    let mut stmt = conn.prepare("SELECT 1 FROM pagetable WHERE lpath = ?1")?;
+    let exists = stmt.exists(rusqlite::params![path])?;
+    Ok(exists)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;

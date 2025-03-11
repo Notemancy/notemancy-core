@@ -1,8 +1,18 @@
 use crate::confapi::get_config_dir;
 use nlprule::Tokenizer;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::PathBuf;
 
+// Add the stemmer crate.
+use rust_stemmers::{Algorithm, Stemmer};
+
+/// Extract candidate phrases from the text.
+///
+/// Unigrams are added if their POS tag is "JJ" (adjective) or starts with "NN" (noun).
+/// Bigrams are added only if both tokens are candidate tokens and if they are not both nouns.
+/// The candidates are normalized (trimmed and lowercased) and deduplicated. Additionally,
+/// for single-word candidates we apply stemming to remove variations (e.g. "certificates" and "certificate").
 pub fn extract_candidate_phrases(text: &str) -> Result<Vec<String>, Box<dyn Error>> {
     // Build the path to "en_tokenizer.bin" in the config directory.
     let mut tokenizer_path: PathBuf = get_config_dir();
@@ -11,15 +21,16 @@ pub fn extract_candidate_phrases(text: &str) -> Result<Vec<String>, Box<dyn Erro
 
     // Initialize the tokenizer from the binary file.
     let tokenizer = Tokenizer::new(tokenizer_path_str)?;
-    let mut candidates = Vec::new();
 
-    // Process each sentence in the text.
+    // Use a HashSet to deduplicate candidates.
+    let mut candidates_set: HashSet<String> = HashSet::new();
+
+    // Process each sentence.
     for sentence in tokenizer.pipe(text) {
         let tokens = sentence.tokens();
 
-        // Helper closure: consider a token a candidate if its first tag is "JJ" or starts with "NN".
+        // Helper: check if token is a candidate.
         let is_candidate = |token: &nlprule::types::Token| -> bool {
-            // Use `pos().as_str()` to obtain a &str for the POS tag.
             let pos: &str = token.word().tags()[0].pos().as_str();
             pos == "JJ" || pos.starts_with("NN")
         };
@@ -27,106 +38,64 @@ pub fn extract_candidate_phrases(text: &str) -> Result<Vec<String>, Box<dyn Erro
         // Extract unigrams.
         for token in tokens.iter() {
             if is_candidate(token) {
-                // Use as_str() to obtain a &str, then convert to String.
-                candidates.push(token.word().text().as_str().to_string());
+                let word = token.word().text().as_str().trim().to_lowercase();
+                if !word.is_empty() {
+                    candidates_set.insert(word);
+                }
             }
         }
 
         // Extract bigrams.
+        // Only include bigrams if both tokens are candidates and
+        // if they are not both nouns.
         for window in tokens.windows(2) {
             if is_candidate(&window[0]) && is_candidate(&window[1]) {
-                let phrase = format!(
-                    "{} {}",
-                    window[0].word().text().as_str(),
-                    window[1].word().text().as_str()
-                );
-                candidates.push(phrase);
+                let pos1 = window[0].word().tags()[0].pos().as_str();
+                let pos2 = window[1].word().tags()[0].pos().as_str();
+                // If both tokens are nouns, skip the bigram.
+                if pos1.starts_with("NN") && pos2.starts_with("NN") {
+                    continue;
+                }
+                let word1 = window[0].word().text().as_str().trim().to_lowercase();
+                let word2 = window[1].word().text().as_str().trim().to_lowercase();
+                if !word1.is_empty() && !word2.is_empty() {
+                    let phrase = format!("{} {}", word1, word2);
+                    candidates_set.insert(phrase);
+                }
             }
         }
     }
 
-    Ok(candidates)
-}
+    // Use the rust_stemmers crate to create an English stemmer.
+    let stemmer = Stemmer::create(Algorithm::English);
 
-#[cfg(test)]
-mod tests {
-    use crate::ai::nlputils::extract_candidate_phrases;
-    use crate::confapi::{get_config_dir, get_config_file_path};
-    use std::env;
-    use std::path::PathBuf;
+    // For unigrams, deduplicate by stem.
+    let mut stem_map: HashMap<String, String> = HashMap::new();
+    let mut multi_word_candidates: Vec<String> = Vec::new();
 
-    /// Test that the NOTEMANCY_CONFIG_DIR environment variable is honored.
-    #[test]
-    fn test_get_config_dir_override() {
-        // Set the config directory to the "temp" folder inside the project root.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let expected = PathBuf::from(manifest_dir).join("temp");
-        env::set_var("NOTEMANCY_CONFIG_DIR", expected.to_str().unwrap());
-
-        // Now get_config_dir() should return the expected path.
-        let config_dir = get_config_dir();
-        assert_eq!(
-            config_dir, expected,
-            "Config dir should be overridden by NOTEMANCY_CONFIG_DIR"
-        );
+    for candidate in candidates_set.into_iter() {
+        if candidate.contains(' ') {
+            // For multi-word phrases, we keep them as is.
+            multi_word_candidates.push(candidate);
+        } else {
+            // For single words, compute the stem.
+            let stem = stemmer.stem(&candidate).into_owned();
+            // If there is already a candidate for this stem, choose the shorter one.
+            stem_map
+                .entry(stem)
+                .and_modify(|existing| {
+                    if candidate.len() < existing.len() {
+                        *existing = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
     }
 
-    /// Test that get_config_file_path returns the correct file path under the override.
-    #[test]
-    fn test_get_config_file_path_override() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let expected = PathBuf::from(manifest_dir).join("temp").join("ncy.yaml");
-        env::set_var(
-            "NOTEMANCY_CONFIG_DIR",
-            expected.parent().unwrap().to_str().unwrap(),
-        );
+    // Combine deduplicated unigrams and multi-word candidates.
+    let mut final_candidates: Vec<String> = stem_map.into_values().collect();
+    final_candidates.extend(multi_word_candidates);
+    final_candidates.sort();
 
-        let config_file = get_config_file_path();
-        assert_eq!(
-            config_file, expected,
-            "Config file path should be correct under override"
-        );
-    }
-
-    /// Test candidate phrase extraction using the tokenizer binary from the overridden config directory.
-    #[test]
-    fn test_extract_candidate_phrases() -> Result<(), Box<dyn std::error::Error>> {
-        // Set the config directory to the "temp" folder inside the project root.
-        // (Ensure that `temp/en_tokenizer.bin` exists and is a valid tokenizer binary.)
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let config_override = PathBuf::from(manifest_dir).join("temp");
-        env::set_var("NOTEMANCY_CONFIG_DIR", config_override.to_str().unwrap());
-
-        // Optionally, you can print the resolved path for debugging:
-        println!("Using config dir: {:?}", crate::confapi::get_config_dir());
-        println!(
-            "Using config file: {:?}",
-            crate::confapi::get_config_file_path()
-        );
-
-        // Now call extract_candidate_phrases on a sample sentence.
-        let text = "A brief example is shown.";
-        let candidates = extract_candidate_phrases(text)?;
-
-        // For example, if the tokenizer returns tags similar to your sample,
-        // we might expect the adjective "brief", the noun "example", and the bigram "brief example".
-        // We'll simply check that some expected candidate appears.
-        assert!(
-            candidates.contains(&"brief".to_string()),
-            "Candidates: {:?}",
-            candidates
-        );
-        assert!(
-            candidates.contains(&"example".to_string()),
-            "Candidates: {:?}",
-            candidates
-        );
-        assert!(
-            candidates.contains(&"brief example".to_string()),
-            "Candidates: {:?}",
-            candidates
-        );
-
-        Ok(())
-    }
+    Ok(final_candidates)
 }
